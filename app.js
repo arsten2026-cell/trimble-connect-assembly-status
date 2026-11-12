@@ -530,6 +530,15 @@
 
   async function load() {
     await loadModel();
+    clearTimeout(waitTimer);
+    if (!state.asms.length && !(allObjects || []).length && waitTries < 30) {
+      // no objects yet: the panel opened before a model was loaded, or the model is still streaming in
+      waitTries++;
+      setStatus(L2("Чакам да се зареди модел…", "Waiting for a model to load…"));
+      waitTimer = setTimeout(() => guarded(load), 4000);
+      return;
+    }
+    waitTries = 0;
     if (!state.asms.length) {
       // say what the viewer returned, so a live problem can be diagnosed from the panel
       const cls = new Map();
@@ -558,7 +567,7 @@
   }
   window.AssemblyStatusApp = { start, state, onEvent: (e, d) => onEvent(e, d) };
 
-  let selTimer = null, reloadTimer = null;
+  let selTimer = null, reloadTimer = null, waitTimer = null, waitTries = 0;
   function onEvent(event, data) {
     if (event === "extension.accessToken") onToken(data);
     if (state.denied || !state.ready) return;
