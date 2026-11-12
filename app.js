@@ -62,11 +62,51 @@
   const psetOf = (p, re) => { const s = (p.properties || []).find((x) => re.test(x.name || "")); const o = {}; if (s) for (const q of s.properties || []) o[q.name] = q.value; return s ? o : null; };
   const val = (o, re) => { const k = Object.keys(o || {}).find((x) => re.test(x)); return k ? o[k] : undefined; };
 
+  // Every object of the loaded models with its class (read once; used when the native class filter returns nothing,
+  // which happens in Connect for some exports, and for assemblies that only exist as hierarchy nodes).
+  let allObjects = null;
+  async function readAll() {
+    if (allObjects) return allObjects;
+    const api = state.api;
+    allObjects = [];
+    for (const m of (await api.viewer.getObjects()) || []) {
+      const ids = (m.objects || []).map((o) => o.id);
+      for (let i = 0; i < ids.length; i += BATCH) {
+        for (const p of (await api.viewer.getObjectProperties(m.modelId, ids.slice(i, i + BATCH))) || []) allObjects.push({ modelId: m.modelId, id: p.id, cls: String(p.class || "") });
+        setStatus(L2(`Чета модела… ${Math.min(i + BATCH, ids.length)} от ${ids.length}`, `Reading the model… ${Math.min(i + BATCH, ids.length)} of ${ids.length}`));
+      }
+    }
+    return allObjects;
+  }
+  async function idsOfClass(cls) {
+    const api = state.api;
+    let models = [];
+    try { models = (await api.viewer.getObjects({ parameter: { class: cls } })) || []; } catch {}
+    const found = models.map((m) => ({ modelId: m.modelId, ids: (m.objects || []).map((o) => o.id) })).filter((m) => m.ids.length);
+    if (found.length) return found;
+    const re = new RegExp(`^${cls}$`, "i");
+    const byModel = new Map();
+    for (const o of await readAll()) if (re.test(o.cls)) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.id); }
+    if (!byModel.size && /elementassembly/i.test(cls)) {
+      // assemblies as parents of the parts (as in Cast unit tags)
+      const all = (await readAll()).filter((o) => !/elementassembly/i.test(o.cls));
+      const seen = new Set();
+      let done = 0;
+      await pool(all, 8, async (o) => {
+        try {
+          const ps = (await api.viewer.getHierarchyParents(o.modelId, [o.id], ELEMENT_ASSEMBLY)) || [];
+          for (const p of ps) { const k = key(o.modelId, p.id); if (!seen.has(k)) { seen.add(k); if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(p.id); } }
+        } catch {}
+        if (++done % 100 === 0) setStatus(L2(`Търся сглобките… ${done} от ${all.length}`, `Finding assemblies… ${done} of ${all.length}`));
+      });
+    }
+    return [...byModel].map(([modelId, ids]) => ({ modelId, ids }));
+  }
+
   async function readClass(cls, psetRe) {
     const api = state.api, out = [];
-    const models = (await api.viewer.getObjects({ parameter: { class: cls } })) || [];
-    for (const m of models) {
-      const ids = (m.objects || []).map((o) => o.id);
+    for (const m of await idsOfClass(cls)) {
+      const ids = m.ids;
       for (let i = 0; i < ids.length; i += BATCH) {
         const chunk = ids.slice(i, i + BATCH);
         const props = (await api.viewer.getObjectProperties(m.modelId, chunk)) || [];
@@ -83,6 +123,7 @@
   }
 
   async function loadModel() {
+    allObjects = null;
     setStatus(L2("Чета сглобките…", "Reading assemblies…"));
     const asms = await readClass("IfcElementAssembly", /^Assembly/i);
     state.asms = asms.map((a) => ({ modelId: a.modelId, id: a.id, guid: a.guid, mark: String(val(a.ps, /Assembly_Pos/i) || "").trim(),
