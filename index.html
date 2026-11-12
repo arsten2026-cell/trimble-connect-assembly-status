@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="bg">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Assembly status</title>
+<style>
+  :root { --bg:#f7f5f0; --ink:#1f1f1f; --muted:#6b6b6b; --line:#d9d5cc; --accent:#E37424; --panel:#fff; --bad:#b3261e; --warn:#fff4e5; }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  body { margin:0; padding:12px; background:var(--bg); color:var(--ink); font:13px/1.4 Ubuntu, "Segoe UI", system-ui, sans-serif; }
+  h1 { font-size:15px; margin:0; font-weight:600; }
+  h2 { font-size:12px; margin:14px 0 6px; font-weight:600; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  .top { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+  .top h1 { margin-right:auto; }
+  .status { font-size:12px; color:var(--muted); margin-bottom:8px; min-height:1.4em; }
+  .status.bad { color:var(--bad); }
+  .box { background:var(--panel); border:1px solid var(--line); padding:8px; }
+  .warn { background:var(--warn); border:1px solid #f0c48a; padding:8px; font-size:12px; margin:6px 0; }
+  .bar { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0; align-items:center; }
+  button { font:inherit; padding:5px 9px; border:1px solid var(--ink); background:var(--ink); color:#fff; cursor:pointer; border-radius:0; }
+  button.secondary { background:transparent; color:var(--ink); border-color:var(--line); }
+  button.small { padding:2px 7px; font-size:12px; }
+  button:disabled { opacity:.45; cursor:default; }
+  select, input[type=date], input[type=text], textarea { font:inherit; font-size:12px; padding:3px 5px; border:1px solid var(--line); border-radius:0; background:#fff; }
+  textarea { width:100%; min-height:60px; resize:vertical; }
+  .act { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--c); padding:7px 8px; margin-bottom:6px; }
+  .act .hd { display:flex; align-items:baseline; gap:6px; }
+  .act .nm { font-weight:600; }
+  .act .st { margin-left:auto; font-size:11px; color:var(--muted); white-space:nowrap; }
+  .act .row { display:flex; gap:4px; margin-top:5px; align-items:center; flex-wrap:wrap; }
+  .act .row input[type=text] { flex:1; min-width:90px; }
+  .act .row input[type=date] { width:122px; }
+  .legend { display:flex; flex-wrap:wrap; gap:4px 10px; font-size:11px; margin:4px 0; }
+  .sw { display:inline-block; width:10px; height:10px; margin-right:4px; vertical-align:-1px; border:1px solid rgba(0,0,0,.25); }
+  label.chk { display:inline-flex; align-items:center; gap:4px; font-size:12px; }
+  table { width:100%; border-collapse:collapse; background:var(--panel); }
+  th, td { padding:4px 3px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+  th { font-size:10.5px; font-weight:600; color:var(--muted); }
+  td.n, th.n { text-align:center; font-variant-numeric:tabular-nums; white-space:nowrap; font-size:11.5px; }
+  .name { font-weight:600; white-space:nowrap; }
+  .sub { font-size:11px; color:var(--muted); }
+  .bad { color:var(--bad); }
+  .tabs { display:flex; gap:4px; flex-wrap:wrap; margin:10px 0 0; }
+  .tabs button { background:transparent; color:var(--ink); border-color:var(--line); }
+  .tabs button.on { background:var(--ink); color:#fff; border-color:var(--ink); }
+  .scroll { max-height:340px; overflow:auto; }
+  .cnt { display:inline-block; min-width:18px; padding:0 4px; font-size:11px; background:#ece8df; text-align:center; }
+</style>
+</head>
+<body>
+<div class="top"><h1 id="title">Assembly status · Монтаж</h1>
+  <select id="selLang" title="Language / Език"><option value="bg">BG</option><option value="en">EN</option></select></div>
+<div id="status" class="status">Connecting to Trimble Connect…</div>
+<div id="setupBox" class="warn" hidden></div>
+
+<div id="main" hidden>
+  <h2 id="hSel"></h2>
+  <div class="box">
+    <div id="selText"></div>
+    <div class="bar"><label class="chk"><input type="checkbox" id="chkFollow" checked> <span id="lblFollow"></span></label>
+      <button id="btnSelClear" class="small secondary"></button></div>
+  </div>
+  <div id="acts"></div>
+
+  <h2 id="hView"></h2>
+  <div class="bar" style="margin:0"><label class="chk"><input type="checkbox" id="chkColour"> <span id="lblColour"></span></label></div>
+  <div id="legend" class="legend"></div>
+
+  <div class="tabs" id="tabs">
+    <button data-tab="marks"></button><button data-tab="deliveries"></button><button data-tab="bolts"></button><button data-tab="docs"></button>
+  </div>
+  <div id="tab-marks"></div>
+  <div id="tab-deliveries" hidden></div>
+  <div id="tab-bolts" hidden></div>
+  <div id="tab-docs" hidden></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/trimble-connect-workspace-api@0.3.38/dist/iife/trimbleconnect.workspace.api.js" integrity="sha384-lFiNt/56q6HnUNbuy0WHO3NP6BkQjY4EH8+5eELYVfnhkB42snRTmSa3UOAlX9gg" crossorigin="anonymous"></script>
+<script src="arsten-access.js?v=7"></script>
+<script src="psetapi.js?v=5"></script>
+<script src="steel.js?v=1"></script>
+<script src="records.js?v=1"></script>
+<script src="app.js?v=2"></script>
+</body>
+</html>

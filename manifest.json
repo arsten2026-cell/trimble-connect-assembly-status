@@ -1,0 +1,7 @@
+{
+  "title": "Assembly status (Arsten)",
+  "url": "https://arsten2026-cell.github.io/trimble-connect-assembly-status/index.html",
+  "icon": "https://arsten2026-cell.github.io/trimble-connect-assembly-status/icon.svg",
+  "description": "Steel erection: erected / wrong / on hold per assembly, deliveries per mark, ready-for-erection colours and the bolt erection list (Multiplan Bolt Location List layout).",
+  "extensionType": ["3dviewer"]
+}
