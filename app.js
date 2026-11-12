@@ -524,7 +524,14 @@
 
   async function load() {
     await loadModel();
-    if (!state.asms.length) { setStatus(L2("В заредените модели няма сглобки (IfcElementAssembly).", "No assemblies (IfcElementAssembly) in the loaded models."), true); return; }
+    if (!state.asms.length) {
+      // say what the viewer returned, so a live problem can be diagnosed from the panel
+      const cls = new Map();
+      for (const o of allObjects || []) cls.set(o.cls || "?", (cls.get(o.cls || "?") || 0) + 1);
+      const seen = [...cls].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([c, n]) => `${c} ${n}`).join(", ");
+      setStatus(L2("В заредените модели няма сглобки (IfcElementAssembly).", "No assemblies (IfcElementAssembly) in the loaded models.") +
+        ` [${(allObjects || []).length} obj${seen ? ": " + seen : ""}]`, true); return;
+    }
     await loadRecords();
     state.ready = true;
     $("main").hidden = false;
