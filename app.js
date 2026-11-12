@@ -274,8 +274,11 @@
   async function cancelDelivery(i) {
     if (!can("status")) return setStatus(t("noRight"), true);
     const d = state.deliveries[i];
-    const reason = window.prompt(L2("Причина за анулиране:", "Reason for cancelling:"), "");
-    if (reason == null) return;
+    // inline reason box in the row (window.prompt is unreliable inside the Connect iframe)
+    if (state.cancelling !== i) { state.cancelling = i; render(); const r = $("dlvReason"); if (r) r.focus(); return; }
+    const reason = (($("dlvReason") || {}).value || "").trim();
+    if (!reason) return setStatus(L2("Въведете причина за анулиране.", "Enter a reason for cancelling."), true);
+    state.cancelling = null;
     const next = R.cancelDelivery(d, { by: state.user, note: reason });
     const { link, ...props } = next;
     await state.client.write(state.lib.id, R.DEF.delivery, d.link, props);
@@ -369,7 +372,9 @@
       <div class="scroll" style="margin-top:6px"><table><thead><tr><th>${L2("Дата", "Date")}</th><th>№</th><th>${L2("Марки", "Marks")}</th><th></th></tr></thead><tbody>`
       + (state.deliveries.length ? state.deliveries.map((d, i) => `<tr${d.cancelled ? ' style="opacity:.5"' : ""}><td>${esc(fmtDate(d.date))}</td><td>${esc(d.note_no || "")}</td>
           <td>${esc(L.parseLines(d.lines).map((l) => `${l.mark}×${l.qty}`).join(", "))}<div class="sub">${esc(d.by || "")}${d.cancelled ? " · " + L2("анулирана", "cancelled") : ""}</div></td>
-          <td>${d.cancelled || !right ? "" : `<button class="small secondary" data-act="dlvCancel" data-i="${i}">${L2("Анулирай", "Cancel")}</button>`}</td></tr>`).join("")
+          <td>${d.cancelled || !right ? "" : state.cancelling === i
+            ? `<input type="text" id="dlvReason" placeholder="${esc(L2("Причина *", "Reason *"))}" style="width:90px"><div class="bar" style="margin:3px 0 0"><button class="small" data-act="dlvCancel" data-i="${i}">${L2("Анулирай", "Cancel it")}</button><button class="small secondary" data-act="dlvCancelNo">${L2("Не", "No")}</button></div>`
+            : `<button class="small secondary" data-act="dlvCancel" data-i="${i}">${L2("Анулирай", "Cancel")}</button>`}</td></tr>`).join("")
         : `<tr><td colspan="4" class="sub">${L2("Няма доставки.", "No deliveries.")}</td></tr>`)
       + `</tbody></table></div>`;
     const f = $("dlvFile");
@@ -509,6 +514,7 @@
       else if (act === "pickMark") await selectMark(b.dataset.mark);
       else if (act === "dlvAdd") await addDelivery(R.parseDeliveryText($("dlvText").value).lines, "typed");
       else if (act === "dlvCancel") await cancelDelivery(+b.dataset.i);
+      else if (act === "dlvCancelNo") { state.cancelling = null; render(); }
       else if (act === "boltXlsx") await exportBoltsXlsx();
       else if (act === "boltPdf") exportBoltsPdf();
       else if (act === "docErected") await exportErected();
