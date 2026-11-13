@@ -10,7 +10,7 @@
   const BATCH = 200;
   const ELEMENT_ASSEMBLY = 4;   // HierarchyType.ElementAssembly
   const T = {
-    title: ["Монтаж · Assembly status", "Assembly status · Монтаж"],
+    title: ["Стомана", "Steel"],
     selection: ["Избрано", "Selection"], follow: ["Следи избора в модела", "Follow model selection"], clear: ["Изчисти", "Clear"],
     nothing: ["Нищо не е избрано. Изберете сглобки в модела или марка от таблицата.", "Nothing selected. Select assemblies in the model or a mark in the table."],
     view: ["Изглед", "View"], colour: ["Оцвети по статус", "Colour by status"],
