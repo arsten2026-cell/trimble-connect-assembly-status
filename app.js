@@ -315,8 +315,15 @@
     const links = state.asms.map((a) => entLink(a.guid));
     const legacy = state.asms.filter((a) => hasLegacy(a.guid)).map((a) => legacyLink(a.guid));
     const toMap = (m) => new Map([...m].map(([l, p]) => { const g = l.replace(/^frn:entity:/, ""); try { return [decodeURIComponent(g), p]; } catch { return [g, p]; } }));
-    // old raw-"$" records first, the encoded ones override them
-    const readBoth = async (def) => new Map([...(legacy.length ? toMap(await state.client.readMany(state.lib.id, def, legacy)) : []), ...toMap(await state.client.readMany(state.lib.id, def, links))]);
+    // old raw-"$" records first, the encoded ones override them; records found only under the raw link are listed
+    // for "move" (state.legacyOnly), because Connect's own panel and Tekla never show them there
+    const legacyOnly = [];
+    const readBoth = async (def) => {
+      const old = legacy.length ? toMap(await state.client.readMany(state.lib.id, def, legacy)) : new Map();
+      const cur = toMap(await state.client.readMany(state.lib.id, def, links));
+      for (const [g, p] of old) if (!cur.has(g)) legacyOnly.push({ def, guid: g, props: p });
+      return new Map([...old, ...cur]);
+    };
     const status = await readBoth(R.DEF.status);
     const holds = await readBoth(R.DEF.hold);
     // fabrication dates: an admin's first visit creates the definition; until then there is nothing to read. Any
@@ -330,7 +337,7 @@
     }
     const dels = await state.client.listAll(state.lib.id, R.DEF.delivery, R.deliveryPrefix(state.project.id));
     if (!current()) return false;
-    state.status = status; state.holds = holds; state.fab = fab; state.fabError = fabError;
+    state.status = status; state.holds = holds; state.fab = fab; state.fabError = fabError; state.legacyOnly = legacyOnly;
     state.deliveries = [...dels].map(([link, p]) => Object.assign({ link }, p)).sort((a, b) => String(b.date).localeCompare(String(a.date)));
     return true;
   }
@@ -512,6 +519,27 @@
       + (skipped.length ? L2(` Пропуснати листове (без GUID / дати): `, ` Sheets skipped (no GUID / dates): `) + skipped.join(", ") : ""), skipped.length > 0);   // round 5, L5
     render();
   }
+  /** Copy every record still stored under a raw-"$" link to its URL-encoded link (15.11.2026). The old record stays;
+   *  a record that already exists under the new link is never overwritten (create only, version check). */
+  async function moveLegacy() {
+    const list = state.legacyOnly || [];
+    if (!list.length || !state.lib) return;
+    if (!can("fab")) return setStatus(t("noRight"), true);
+    let done = 0, failed = 0, first = "";
+    await pool(list, 6, async (r) => {
+      try {
+        const cur = await state.client.readOne(state.lib.id, r.def, entLink(r.guid));
+        if (cur && cur.props) { done++; return; }   // already there (moved by someone else)
+        await state.client.writeIfUnchanged(state.lib.id, r.def, entLink(r.guid), r.props, cur ? cur.v : undefined);
+        done++;
+      } catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
+    });
+    await loadRecords();
+    setStatus(L2(`Преместени ${done} записа.`, `Moved ${done} records.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
+      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failed > 0);
+    render();
+  }
+
   async function applyFab() {
     const fp = state.fabPlan;
     if (!fp) return;
@@ -621,6 +649,8 @@
         <div>${L2("Изработени", "Fabricated")}: <b>${fabN}</b> · ${L2("Доставени", "Delivered")}: <b>${delN}</b> / ${total}</div>
         <div class="bar"><label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel от производителя", "Import the fabricator's Excel")}<input type="file" id="fabFile" accept=".xlsx,.xls,.htm,.html" hidden></label>
           ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div>
+        ${(state.legacyOnly || []).length ? `<div class="warn">${esc(L2(`${state.legacyOnly.length} записа (сглобки с „$“ в GUID) са в стар формат и не се виждат в панела на Connect и в Tekla.`, `${state.legacyOnly.length} records (assemblies with "$" in the GUID) are in the old format and are not shown in Connect's panel or Tekla.`))}
+          <div class="bar"><button class="small" data-act="moveLegacy" ${right ? "" : "disabled"}>${esc(L2("Премести", "Move"))}</button></div></div>` : ""}
         <div class="sub">${esc(L2("Файлът от отчета AM_Fabrication с попълнени оранжеви колони. Сглобките се разпознават по GUID. Празна клетка не изтрива дата. Tekla чете датите като ASSEMBLY.PSET.AM_Fabrication.* след „Synchronize property sets“.",
           "The AM_Fabrication report file with the orange columns filled. Assemblies are matched by GUID. An empty cell never clears a date. Tekla reads the dates as ASSEMBLY.PSET.AM_Fabrication.* after \"Synchronize property sets\"."))}</div></div>${preview}`;
     const f = $("fabFile");
@@ -793,6 +823,7 @@
       else if (act === "dlvCancel") await cancelDelivery(+b.dataset.i);
       else if (act === "dlvCancelNo") { state.cancelling = null; render(); }
       else if (act === "fabApply") await applyFab();
+      else if (act === "moveLegacy") await moveLegacy();
       else if (act === "fabCancel") { state.fabPlan = null; setStatus(L2("Импортът е отказан.", "Import cancelled.")); render(); }
       else if (act === "boltXlsx") await exportBoltsXlsx();
       else if (act === "boltPdf") exportBoltsPdf();
