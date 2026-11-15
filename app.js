@@ -37,10 +37,16 @@
     api: null, client: null, project: null, user: "", access: null, lib: null, ready: false,
     asms: [], byKey: new Map(), byGuid: new Map(),   // assembly instances {modelId, id, guid, mark, layer, weight, finish, parts:[runtime ids]}
     bolts: [], status: new Map(), holds: new Map(), deliveries: [],
-    fab: new Map(), fabPlan: null, fabMs: false,   // fabMs: TEST (15.11.2026) - write under the MS-form GUID link, see msLink   // fabrication dates per IFC GUID (fabrication.js); the import waiting for "Save"
+    fab: new Map(), fabPlan: null,   // fabrication dates per IFC GUID (fabrication.js); the import waiting for "Save"
     sel: [], coloured: false, tab: "marks", boltScope: "all", follow: true,
   };
   const key = (modelId, id) => modelId + ":" + id;
+  // Pset link of a model object. FRN (Trimble's link notation) wants every segment URL-encoded, and Connect's own
+  // panel and Tekla look an IFC GUID up encoded: "$" -> "%24". Links written with a raw "$" (before v16) are never
+  // shown there, so they are still read (legacyLink) but every new write goes to the encoded link (15.11.2026).
+  const entLink = (guid) => "frn:entity:" + encodeURIComponent(guid);
+  const legacyLink = (guid) => "frn:entity:" + guid;
+  const hasLegacy = (guid) => entLink(guid) !== legacyLink(guid);
   const can = (what) => {
     const r = state.access && state.access.role;
     if (window.ARSTEN_DEMO) return true;
@@ -306,16 +312,19 @@
       try { await state.client.ensureDefinition(state.lib.id, d); }
       catch (e) { if (e.status !== 403) throw e; }   // non-admins cannot create definitions; reading still works
     }
-    const links = state.asms.map((a) => "frn:entity:" + a.guid);
-    const toMap = (m) => new Map([...m].map(([l, p]) => [l.replace(/^frn:entity:/, ""), p]));
-    const status = toMap(await state.client.readMany(state.lib.id, R.DEF.status, links));
-    const holds = toMap(await state.client.readMany(state.lib.id, R.DEF.hold, links));
+    const links = state.asms.map((a) => entLink(a.guid));
+    const legacy = state.asms.filter((a) => hasLegacy(a.guid)).map((a) => legacyLink(a.guid));
+    const toMap = (m) => new Map([...m].map(([l, p]) => { const g = l.replace(/^frn:entity:/, ""); try { return [decodeURIComponent(g), p]; } catch { return [g, p]; } }));
+    // old raw-"$" records first, the encoded ones override them
+    const readBoth = async (def) => new Map([...(legacy.length ? toMap(await state.client.readMany(state.lib.id, def, legacy)) : []), ...toMap(await state.client.readMany(state.lib.id, def, links))]);
+    const status = await readBoth(R.DEF.status);
+    const holds = await readBoth(R.DEF.hold);
     // fabrication dates: an admin's first visit creates the definition; until then there is nothing to read. Any
     // error here only disables the Производство tab, never the rest of Стомана (round 5, M3)
     let fab = new Map(), fabError = "";
     try {
       try { await state.client.ensureDefinition(state.lib.id, F.definition()); } catch (e) { if (e.status !== 403) throw e; }
-      fab = toMap(await state.client.readMany(state.lib.id, F.DEF_ID, links));
+      fab = await readBoth(F.DEF_ID);
     } catch (e) {
       if (e.status !== 404) { fabError = errText(e); console.warn("fabrication dates not available", e); }
     }
@@ -363,7 +372,7 @@
       if (!on && !(cur && cur[kind])) return;
       const next = R.setFlag(cur, kind, on, { date, note, by: state.user, mark: a.mark });
       try {
-        await (on ? state.client.write : state.client.replace).call(state.client, state.lib.id, def, "frn:entity:" + a.guid, next);
+        await (on ? state.client.write : state.client.replace).call(state.client, state.lib.id, def, entLink(a.guid), next);
         store.set(a.guid, next); done++;
       } catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
     });
@@ -481,16 +490,6 @@
     }));
     return { sheets: [{ name: "", rows }], date1904: false };
   }
-  // TEST (15.11.2026): records linked by the IFC GUID are not shown by Connect's own panel or Tekla when the GUID holds a "$".
-  // The admin switch writes the same record under the MS-form GUID ("03b0caff-a82e-...") to see whether those consumers use it.
-  const IFC64 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
-  function ifcToMs(g) {
-    let n = 0n;
-    for (const ch of String(g)) { const v = IFC64.indexOf(ch); if (v < 0) return ""; n = n * 64n + BigInt(v); }
-    const h = n.toString(16).padStart(32, "0");
-    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
-  }
-  const fabLink = (ifc) => "frn:entity:" + (state.fabMs ? ifcToMs(ifc) : ifc);
 
   async function importFab(file) {
     state.fabPlan = null;
@@ -507,7 +506,7 @@
         : L2("Няма колона GUID – това не е файл от отчета AM_Fabrication.", "No GUID column – this is not a file from the AM_Fabrication report."), true);
     }
     const known = new Map(state.asms.map((a) => [a.guid, { mark: a.mark }]));
-    state.fabPlan = { source: file.name, p: F.plan(rows, { toIfc: L.tcGuidToIfc, known, existing: state.fabMs ? new Map() : state.fab, date1904: wb.date1904 }) };
+    state.fabPlan = { source: file.name, p: F.plan(rows, { toIfc: L.tcGuidToIfc, known, existing: state.fab, date1904: wb.date1904 }) };
     state.tab = "fab";
     setStatus(L2(`Прочетен ${file.name}: проверете промените и натиснете „Запиши“.`, `Read ${file.name}: check the changes and press "Save".`)
       + (skipped.length ? L2(` Пропуснати листове (без GUID / дати): `, ` Sheets skipped (no GUID / dates): `) + skipped.join(", ") : ""), skipped.length > 0);   // round 5, L5
@@ -523,16 +522,19 @@
     let done = 0, first = "";
     const failedList = [], meanwhile = [];
     await pool(fp.p.changes, 6, async (c) => {
-      const link = fabLink(c.ifc);
+      const link = entLink(c.ifc);
       try {
         for (let attempt = 0; ; attempt++) {
           const cur = await state.client.readOne(state.lib.id, F.DEF_ID, link);
-          const fresh = (cur && cur.props) || {};
+          let fresh = (cur && cur.props) || null, moved = false;
+          // first write to the encoded link of a "$" GUID: the old raw-"$" record is the base and all its fields move over
+          if (!fresh && hasLegacy(c.ifc)) { const old = await state.client.readOne(state.lib.id, F.DEF_ID, legacyLink(c.ifc)); fresh = old && old.props; moved = !!fresh; }
+          fresh = fresh || {};
           if (F.changedSince(c, c.before, fresh).length) { meanwhile.push(c.mark || c.ifc); state.fab.set(c.ifc, fresh); return; }
-          const patch = F.patchFor(fresh, c, { source: fp.source, by: state.user });
+          const patch = Object.assign(moved ? Object.assign({}, fresh) : {}, F.patchFor(fresh, c, { source: fp.source, by: state.user }));
           try { await state.client.writeIfUnchanged(state.lib.id, F.DEF_ID, link, patch, cur ? cur.v : undefined); }
           catch (e) { if ((e.status === 412 || e.status === 409) && attempt < 3) continue; throw e; }
-          if (!state.fabMs) state.fab.set(c.ifc, Object.assign({}, fresh, patch));
+          state.fab.set(c.ifc, Object.assign({}, fresh, patch));
           done++;
           return;
         }
@@ -619,11 +621,8 @@
         <div>${L2("Изработени", "Fabricated")}: <b>${fabN}</b> · ${L2("Доставени", "Delivered")}: <b>${delN}</b> / ${total}</div>
         <div class="bar"><label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel от производителя", "Import the fabricator's Excel")}<input type="file" id="fabFile" accept=".xlsx,.xls,.htm,.html" hidden></label>
           ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div>
-        ${right ? `<label class="chk"><input type="checkbox" id="fabMs" ${state.fabMs ? "checked" : ""}> ${esc(L2("Тест: запис с GUID (MS)", "Test: write with GUID (MS)"))}</label>` : ""}
         <div class="sub">${esc(L2("Файлът от отчета AM_Fabrication с попълнени оранжеви колони. Сглобките се разпознават по GUID. Празна клетка не изтрива дата. Tekla чете датите като ASSEMBLY.PSET.AM_Fabrication.* след „Synchronize property sets“.",
           "The AM_Fabrication report file with the orange columns filled. Assemblies are matched by GUID. An empty cell never clears a date. Tekla reads the dates as ASSEMBLY.PSET.AM_Fabrication.* after \"Synchronize property sets\"."))}</div></div>${preview}`;
-    const ms = $("fabMs");
-    if (ms) ms.onchange = (e) => { state.fabMs = e.target.checked; state.fabPlan = null; render(); };
     const f = $("fabFile");
     if (f) f.onchange = (e) => guarded(async () => { const file = e.target.files[0]; e.target.value = ""; if (file) await importFab(file); });
   }
