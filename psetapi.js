@@ -158,6 +158,11 @@
       return this.request("pset", psetPath(link, libId, defId), "PATCH", body);
     }
 
+    /** Delete one pset; no error when it does not exist (404) or is already deleted (410). */
+    async remove(libId, defId, link) {
+      try { await this.request("pset", psetPath(link, libId, defId), "DELETE"); } catch (e) { if (e.status !== 404 && e.status !== 410) throw e; }
+    }
+
     /** Replace the whole status of one object, so fields can be cleared (pset-api rejects "" and null for typed
      *  fields, and PATCH cannot remove a field). Same as Connect web: delete, then re-create; if the deleted pset
      *  still blocks (412), re-create on top of its version. */

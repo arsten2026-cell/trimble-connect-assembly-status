@@ -315,14 +315,22 @@
     const links = state.asms.map((a) => entLink(a.guid));
     const legacy = state.asms.filter((a) => hasLegacy(a.guid)).map((a) => legacyLink(a.guid));
     const toMap = (m) => new Map([...m].map(([l, p]) => { const g = l.replace(/^frn:entity:/, ""); try { return [decodeURIComponent(g), p]; } catch { return [g, p]; } }));
-    // old raw-"$" records first, the encoded ones override them; records found only under the raw link are listed
-    // for "move" (state.legacyOnly), because Connect's own panel and Tekla never show them there
+    // Records still under a raw-"$" link (Connect's own panel and Tekla never show them) are listed in
+    // state.legacyOnly for "Премести": kind "move" = only the raw record exists; "merge" = both exist and the raw one
+    // has history the encoded one lacks (an old cached client wrote it after the move, round 6 M2) - its fields win;
+    // "stale" = the raw one is an old copy already contained in the encoded record - only deleted.
     const legacyOnly = [];
+    const isStale = (raw, enc) => { const rl = String(raw.log || ""); return JSON.stringify(raw) === JSON.stringify(enc) || (rl !== "" && String(enc.log || "").includes(rl)); };
     const readBoth = async (def) => {
       const old = legacy.length ? toMap(await state.client.readMany(state.lib.id, def, legacy)) : new Map();
       const cur = toMap(await state.client.readMany(state.lib.id, def, links));
-      for (const [g, p] of old) if (!cur.has(g)) legacyOnly.push({ def, guid: g, props: p });
-      return new Map([...old, ...cur]);
+      const out = new Map(cur);
+      for (const [g, p] of old) {
+        if (!cur.has(g)) { legacyOnly.push({ def, guid: g, kind: "move" }); out.set(g, p); }
+        else if (isStale(p, cur.get(g))) legacyOnly.push({ def, guid: g, kind: "stale" });
+        else { legacyOnly.push({ def, guid: g, kind: "merge" }); out.set(g, Object.assign({}, cur.get(g), p, { log: [cur.get(g).log, p.log].filter(Boolean).join("\n") })); }
+      }
+      return out;
     };
     const status = await readBoth(R.DEF.status);
     const holds = await readBoth(R.DEF.hold);
@@ -381,6 +389,7 @@
       try {
         await (on ? state.client.write : state.client.replace).call(state.client, state.lib.id, def, entLink(a.guid), next);
         store.set(a.guid, next); done++;
+        await dropLegacy(def, a.guid);
       } catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
     });
     setStatus(`${t(kind)}: ${on ? L2("записано", "saved") : L2("отменено", "undone")} ${done}` + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : ""), failed > 0);
@@ -499,6 +508,7 @@
   }
 
   async function importFab(file) {
+    state.fabClearArmed = 0;
     state.fabPlan = null;
     const wb = await readWorkbook(file);
     const rows = [], skipped = [];
@@ -519,28 +529,92 @@
       + (skipped.length ? L2(` Пропуснати листове (без GUID / дати): `, ` Sheets skipped (no GUID / dates): `) + skipped.join(", ") : ""), skipped.length > 0);   // round 5, L5
     render();
   }
-  /** Copy every record still stored under a raw-"$" link to its URL-encoded link (15.11.2026). The old record stays;
-   *  a record that already exists under the new link is never overwritten (create only, version check). */
+  const rightFor = (def) => can(def === R.DEF.hold ? "hold" : def === R.DEF.status ? "status" : "fab");
+  /** After a record is safely under its encoded link, delete the raw-"$" copy, so it can never come back when the
+   *  encoded one is deleted later (round 6 M1). Failures are ignored: the raw copy is then listed as "stale". */
+  async function dropLegacy(def, guid) {
+    if (!hasLegacy(guid) || !(state.legacyOnly || []).some((r) => r.def === def && r.guid === guid)) return;
+    try { await state.client.remove(state.lib.id, def, legacyLink(guid)); } catch (e) { console.warn("raw link not deleted", guid, e); }
+  }
+  /** "Премести": every record still under a raw-"$" link goes to its URL-encoded link, then the raw one is deleted.
+   *  Both are read fresh (round 6 L3); an encoded record is only filled with fields it lacks, unless the raw one is
+   *  newer (written by an old cached client after the move, M2) - then the raw fields win and its history is added. */
   async function moveLegacy() {
     const list = state.legacyOnly || [];
     if (!list.length || !state.lib) return;
-    if (!can("fab")) return setStatus(t("noRight"), true);
-    let done = 0, failed = 0, first = "";
+    let done = 0, failed = 0, skipped = 0, first = "";
     await pool(list, 6, async (r) => {
+      if (!rightFor(r.def)) { skipped++; return; }
       try {
-        const cur = await state.client.readOne(state.lib.id, r.def, entLink(r.guid));
-        if (cur && cur.props) { done++; return; }   // already there (moved by someone else)
-        await state.client.writeIfUnchanged(state.lib.id, r.def, entLink(r.guid), r.props, cur ? cur.v : undefined);
+        const raw = await state.client.readOne(state.lib.id, r.def, legacyLink(r.guid));
+        const rp = raw && raw.props;
+        if (rp) {
+          const enc = await state.client.readOne(state.lib.id, r.def, entLink(r.guid));
+          const ep = enc && enc.props;
+          let patch = null;
+          if (!ep) patch = rp;
+          else if (r.kind === "merge") {
+            patch = {};
+            for (const [k, v] of Object.entries(rp)) if (k !== "log" && JSON.stringify(v) !== JSON.stringify(ep[k])) patch[k] = v;
+            const extra = String(rp.log || "").split("\n").filter((l) => l && !String(ep.log || "").includes(l));
+            if (extra.length) patch.log = [ep.log, ...extra].filter(Boolean).join("\n").slice(-1500);
+          } else {
+            patch = {};
+            for (const [k, v] of Object.entries(rp)) if (!(k in ep)) patch[k] = v;
+          }
+          if (patch && Object.keys(patch).length) await state.client.writeIfUnchanged(state.lib.id, r.def, entLink(r.guid), patch, enc ? enc.v : undefined);
+          await state.client.remove(state.lib.id, r.def, legacyLink(r.guid));
+        }
         done++;
       } catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
     });
     await loadRecords();
-    setStatus(L2(`Преместени ${done} записа.`, `Moved ${done} records.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
+    setStatus(L2(`Преместени ${done} записа.`, `Moved ${done} records.`) + (skipped ? ` · ${skipped} ${L2("без права", "no right")}` : "")
+      + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
+      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failed > 0);
+    render();
+  }
+
+  // Clearing dates (admin): an empty Excel cell never clears a date, so this is the way to correct one or remove test
+  // data. Every link form ever written is deleted: URL-encoded, raw "$" (before v16) and the MS-form test of v14/v15.
+  const IFC64 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
+  function ifcToMs(g) {
+    let n = 0n;
+    for (const ch of String(g)) { const v = IFC64.indexOf(ch); if (v < 0) return ""; n = n * 64n + BigInt(v); }
+    const h = n.toString(16).padStart(32, "0");
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+  }
+  const isAdmin = () => !!(window.ARSTEN_DEMO || (state.access && state.access.role === "admin"));
+  // the confirm click must follow within 10 s (round 6 L5)
+  const clearArmed = () => !!state.fabClearArmed && Date.now() - state.fabClearArmed < 10000;
+  async function clearFab() {
+    if (!state.lib || !isAdmin()) return setStatus(t("noRight"), true);
+    if (!clearArmed()) { state.fabClearArmed = Date.now(); render(); setTimeout(render, 10500); return; }   // second click confirms
+    state.fabClearArmed = 0;
+    const list = state.sel.slice();
+    // every link stored for these assemblies, whatever its form (round 6 L6), plus the forms we know of
+    const ids = new Map(list.map((a) => [a.guid, new Set([a.guid, ifcToMs(a.guid).toLowerCase()])]));
+    const all = await state.client.listAll(state.lib.id, F.DEF_ID, "frn:entity:");
+    const found = new Map(list.map((a) => [a.guid, new Set([legacyLink(a.guid), "frn:entity:" + ifcToMs(a.guid)])]));
+    for (const link of all.keys()) {
+      let id = link.replace(/^frn:entity:/, ""); try { id = decodeURIComponent(id); } catch {}
+      for (const [g, set] of ids) if (set.has(id) || set.has(id.toLowerCase())) found.get(g).add(link);
+    }
+    let done = 0, failed = 0, first = "";
+    await pool(list, 6, async (a) => {
+      // other forms first, the encoded (visible) one last: a failure never leaves an old copy behind it (round 6 L1)
+      const links = [...found.get(a.guid)].filter((l) => l !== entLink(a.guid)).concat(entLink(a.guid));
+      try { for (const l of links) await state.client.remove(state.lib.id, F.DEF_ID, l); state.fab.delete(a.guid); done++; }
+      catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
+    });
+    await loadRecords();
+    setStatus(L2(`Изтрити дати: ${done} сглобки.`, `Dates cleared: ${done} assemblies.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
       + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failed > 0);
     render();
   }
 
   async function applyFab() {
+    state.fabClearArmed = 0;
     const fp = state.fabPlan;
     if (!fp) return;
     if (!state.lib) return setStatus(L2("Няма библиотека STEEL/Монтаж.", "No library STEEL/Монтаж."), true);
@@ -563,6 +637,7 @@
           try { await state.client.writeIfUnchanged(state.lib.id, F.DEF_ID, link, patch, cur ? cur.v : undefined); }
           catch (e) { if ((e.status === 412 || e.status === 409) && attempt < 3) continue; throw e; }
           state.fab.set(c.ifc, Object.assign({}, fresh, patch));
+          if (moved) await dropLegacy(F.DEF_ID, c.ifc);
           done++;
           return;
         }
@@ -649,17 +724,26 @@
         <div>${L2("Изработени", "Fabricated")}: <b>${fabN}</b> · ${L2("Доставени", "Delivered")}: <b>${delN}</b> / ${total}</div>
         <div class="bar"><label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel от производителя", "Import the fabricator's Excel")}<input type="file" id="fabFile" accept=".xlsx,.xls,.htm,.html" hidden></label>
           ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div>
-        ${(state.legacyOnly || []).length ? `<div class="warn">${esc(L2(`${state.legacyOnly.length} записа (сглобки с „$“ в GUID) са в стар формат и не се виждат в панела на Connect и в Tekla.`, `${state.legacyOnly.length} records (assemblies with "$" in the GUID) are in the old format and are not shown in Connect's panel or Tekla.`))}
-          <div class="bar"><button class="small" data-act="moveLegacy" ${right ? "" : "disabled"}>${esc(L2("Премести", "Move"))}</button></div></div>` : ""}
+        ${legacyBanner()}
+        ${isAdmin() && state.sel.length ? `<div class="bar"><button class="small secondary" data-act="clearFab">${esc(clearArmed()
+          ? L2(`Потвърди: изтрий датите на ${state.sel.length} сглобки`, `Confirm: clear the dates of ${state.sel.length} assemblies`)
+          : L2(`Изтрий датите на избраните (${state.sel.length})`, `Clear the dates of the selected (${state.sel.length})`))}</button></div>` : ""}
         <div class="sub">${esc(L2("Файлът от отчета AM_Fabrication с попълнени оранжеви колони. Сглобките се разпознават по GUID. Празна клетка не изтрива дата. Tekla чете датите като ASSEMBLY.PSET.AM_Fabrication.* след „Synchronize property sets“.",
           "The AM_Fabrication report file with the orange columns filled. Assemblies are matched by GUID. An empty cell never clears a date. Tekla reads the dates as ASSEMBLY.PSET.AM_Fabrication.* after \"Synchronize property sets\"."))}</div></div>${preview}`;
     const f = $("fabFile");
     if (f) f.onchange = (e) => guarded(async () => { const file = e.target.files[0]; e.target.value = ""; if (file) await importFab(file); });
   }
 
+  function legacyBanner() {
+    const n = (state.legacyOnly || []).length;
+    if (!n) return "";
+    const any = ["status", "hold", "fab"].some((w) => can(w));
+    return `<div class="warn">${esc(L2(`${n} записа (сглобки с „$“ в GUID) са в стар формат и не се виждат в панела на Connect и в Tekla.`, `${n} records (assemblies with "$" in the GUID) are in the old format and are not shown in Connect's panel or Tekla.`))}
+      <div class="bar"><button class="small" data-act="moveLegacy" ${any ? "" : "disabled"}>${esc(L2("Премести", "Move"))}</button></div></div>`;
+  }
   function renderMarks(av) {
     const over = av.marks.filter((m) => m.over);
-    $("tab-marks").innerHTML = (over.length ? `<div class="warn">${esc(L2("Монтирани повече от доставените: ", "Erected more than delivered: "))}${esc(over.map((m) => `${m.mark} (${m.erected}/${m.delivered})`).join(", "))}</div>` : "")
+    $("tab-marks").innerHTML = legacyBanner() + (over.length ? `<div class="warn">${esc(L2("Монтирани повече от доставените: ", "Erected more than delivered: "))}${esc(over.map((m) => `${m.mark} (${m.erected}/${m.delivered})`).join(", "))}</div>` : "")
       + (av.unknownDeliveredMarks.length ? `<div class="warn">${esc(L2("Доставени марки, които ги няма в модела: ", "Delivered marks not in the model: "))}${esc(av.unknownDeliveredMarks.join(", "))}</div>` : "")
       + `<div class="scroll"><table><thead><tr><th>${L2("Марка", "Mark")}</th><th class="n">${L2("Бр.", "Qty")}</th><th class="n">${L2("Дост.", "Deliv.")}</th><th class="n">${L2("Монт.", "Erect.")}</th><th class="n" title="${esc(L2("доставени − монтирани", "delivered − erected"))}">${L2("Налични", "Available")}</th><th class="n">${L2("Не дост.", "Not del.")}</th></tr></thead><tbody>`
       + av.marks.map((m, i) => `<tr><td class="name"><button class="small secondary" data-act="pickMark" data-mark="${esc(m.mark)}" title="${esc(L2("Избери в модела", "Select in the model"))}">${esc(m.mark || "?")}</button>${m.hold ? ` <span class="sub">${L2("задърж.", "hold")} ${m.hold}</span>` : ""}${m.wrong ? ` <span class="bad sub">${L2("грешни", "wrong")} ${m.wrong}</span>` : ""}</td>
@@ -798,12 +882,12 @@
       const p = await parentAssembly(m.modelId, id);   // a part was clicked: take its assembly
       if (p) picked.set(p.guid, p);
     }
-    state.sel = [...picked.values()];
+    state.sel = [...picked.values()]; state.fabClearArmed = 0;
     render();
   }
   async function selectMark(mark) {
     const list = state.asms.filter((a) => L.normMark(a.mark) === L.normMark(mark));
-    state.sel = list;
+    state.sel = list; state.fabClearArmed = 0;
     const s = sel(list);
     await state.api.viewer.setSelection(s, "set");
     try { await state.api.viewer.setCamera(s, { animationTime: 400 }); } catch {}
@@ -814,7 +898,7 @@
   document.addEventListener("click", (e) => {
     const b = e.target.closest("button[data-act], #tabs button");
     if (!b) return;
-    if (b.dataset.tab) { state.tab = b.dataset.tab; render(); return; }
+    if (b.dataset.tab) { state.tab = b.dataset.tab; state.fabClearArmed = 0; render(); return; }
     const act = b.dataset.act;
     guarded(async () => {
       if (act === "on" || act === "off") await applyFlag(b.dataset.kind, act === "on");
@@ -824,6 +908,7 @@
       else if (act === "dlvCancelNo") { state.cancelling = null; render(); }
       else if (act === "fabApply") await applyFab();
       else if (act === "moveLegacy") await moveLegacy();
+      else if (act === "clearFab") await clearFab();
       else if (act === "fabCancel") { state.fabPlan = null; setStatus(L2("Импортът е отказан.", "Import cancelled.")); render(); }
       else if (act === "boltXlsx") await exportBoltsXlsx();
       else if (act === "boltPdf") exportBoltsPdf();
@@ -832,7 +917,7 @@
       else if (act === "docDeliveries") await exportDeliveries();
     });
   });
-  $("btnSelClear").onclick = () => { state.sel = []; render(); };
+  $("btnSelClear").onclick = () => { state.sel = []; state.fabClearArmed = 0; render(); };
   $("chkFollow").onchange = (e) => { state.follow = e.target.checked; };
   $("chkColour").onchange = (e) => guarded(async () => { state.coloured = e.target.checked; await applyColours(); });
   $("selLang").value = lang;
