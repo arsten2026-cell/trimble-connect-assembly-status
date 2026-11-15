@@ -619,7 +619,7 @@
         <div>${L2("Изработени", "Fabricated")}: <b>${fabN}</b> · ${L2("Доставени", "Delivered")}: <b>${delN}</b> / ${total}</div>
         <div class="bar"><label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel от производителя", "Import the fabricator's Excel")}<input type="file" id="fabFile" accept=".xlsx,.xls,.htm,.html" hidden></label>
           ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div>
-        ${state.access && state.access.role === "admin" ? `<label class="chk"><input type="checkbox" id="fabMs" ${state.fabMs ? "checked" : ""}> ${esc(L2("Тест: запис с GUID (MS)", "Test: write with GUID (MS)"))}</label>` : ""}
+        ${right ? `<label class="chk"><input type="checkbox" id="fabMs" ${state.fabMs ? "checked" : ""}> ${esc(L2("Тест: запис с GUID (MS)", "Test: write with GUID (MS)"))}</label>` : ""}
         <div class="sub">${esc(L2("Файлът от отчета AM_Fabrication с попълнени оранжеви колони. Сглобките се разпознават по GUID. Празна клетка не изтрива дата. Tekla чете датите като ASSEMBLY.PSET.AM_Fabrication.* след „Synchronize property sets“.",
           "The AM_Fabrication report file with the orange columns filled. Assemblies are matched by GUID. An empty cell never clears a date. Tekla reads the dates as ASSEMBLY.PSET.AM_Fabrication.* after \"Synchronize property sets\"."))}</div></div>${preview}`;
     const ms = $("fabMs");
