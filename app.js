@@ -130,26 +130,52 @@
       layer: val(a.ps, /^Layer/i) || "", weight: val(a.ps, /Assembly_Weight/i) || "", finish: val(a.ps, /^Finish/i) || "", parts: [] }));
     state.byKey = new Map(state.asms.map((a) => [key(a.modelId, a.id), a]));
     state.byGuid = new Map(state.asms.map((a) => [a.guid, a]));
-    // parts of each assembly (for colouring and the old-export fallback)
+    // children of each assembly (parts and, in Tekla IFC, its bolts): one call per ASSEMBLY, reused below so the bolts
+    // need no call each (4000 bolts used to mean ~8000 one-by-one calls; user 15.11.2026)
+    const asmOfChild = new Map();   // key(model, child runtime id) -> assembly
+    let doneA = 0;
     await pool(state.asms, 8, async (a) => {
       try { a.parts = ((await state.api.viewer.getHierarchyChildren(a.modelId, [a.id], ELEMENT_ASSEMBLY)) || []).map((c) => c.id); } catch { a.parts = []; }
+      for (const id of a.parts) asmOfChild.set(key(a.modelId, id), a);
+      if (++doneA % 50 === 0) setStatus(L2(`Чета сглобките… ${doneA} от ${state.asms.length}`, `Reading assemblies… ${doneA} of ${state.asms.length}`));
     });
     setStatus(L2("Чета болтовете…", "Reading bolts…"));
     const fs = await readClass("IfcMechanicalFastener", /^Bolt/i);
+    // bolts are not parts: keep them out of the parts lists (colouring)
+    const boltKeys = new Set(fs.map((f) => key(f.modelId, f.id)));
+    for (const a of state.asms) a.parts = a.parts.filter((id) => !boltKeys.has(key(a.modelId, id)));
     const assemblyOfPart = new Map();
+    // main parts: Tekla GUID -> IFC GlobalId -> runtime id, in batches of 500 per model, then its assembly from the map
+    const mainByModel = new Map();
+    for (const f of fs) {
+      const ifc = L.tcGuidToIfc(String(val(f.ps, /Main_Part_GUID/i) || "").trim());
+      if (!ifc) continue;
+      if (!mainByModel.has(f.modelId)) mainByModel.set(f.modelId, new Set());
+      mainByModel.get(f.modelId).add(ifc);
+    }
+    let slow = 0;   // lookups that still needed a call each (fallback)
+    for (const [m, set] of mainByModel) {
+      const guids = [...set];
+      for (let i = 0; i < guids.length; i += 500) {
+        const chunk = guids.slice(i, i + 500);
+        let rts = [];
+        try { rts = (await state.api.viewer.convertToObjectRuntimeIds(m, chunk)) || []; } catch {}
+        const missing = [];
+        chunk.forEach((g, k) => {
+          const a = rts[k] != null ? asmOfChild.get(key(m, rts[k])) : null;
+          if (a) assemblyOfPart.set(g, a.guid); else if (rts[k] != null) missing.push([g, rts[k]]);
+        });
+        await pool(missing, 6, async ([g, rt]) => { slow++; try { const a = await parentAssembly(m, rt); if (a) assemblyOfPart.set(g, a.guid); } catch {} });
+      }
+    }
     const bolts = [];
+    let doneB = 0;
     await pool(fs, 6, async (f) => {
-      const own = await parentAssembly(f.modelId, f.id);
+      let own = asmOfChild.get(key(f.modelId, f.id)) || null;
+      if (!own) { slow++; try { own = await parentAssembly(f.modelId, f.id); } catch { own = null; } }
+      if (++doneB % 200 === 0) setStatus(L2(`Чета болтовете… ${doneB} от ${fs.length}`, `Reading bolts… ${doneB} of ${fs.length}`));
       const hasLinks = Object.keys(f.ps).some((k) => /Main_Part_GUID|Connected_Assemblies/i.test(k));
       const mainPart = String(val(f.ps, /Main_Part_GUID/i) || "").trim();
-      const ifc = L.tcGuidToIfc(mainPart);
-      if (ifc && !assemblyOfPart.has(ifc)) {
-        try {
-          const rt = ((await state.api.viewer.convertToObjectRuntimeIds(f.modelId, [ifc])) || [])[0];
-          const a = rt != null ? await parentAssembly(f.modelId, rt) : null;
-          if (a) assemblyOfPart.set(ifc, a.guid);
-        } catch {}
-      }
       const ca = val(f.ps, /Connected_Assemblies/i);
       bolts.push({ modelId: f.modelId, id: f.id, guid: f.guid, ownGuid: own && own.guid, ownMark: own ? own.mark : "?",
         mainPart, otherMarks: hasLinks ? L.parseMarks(ca) : null, connected: ca || "",
@@ -173,6 +199,7 @@
     if (exportHasLinks) for (const b of bolts) if (b.otherMarks == null) b.otherMarks = [];
     for (const b of bolts) b.sides = b.ownGuid ? L.resolveSides(b, { assemblyOfPart, assemblies, opts: { abs: 0.2, rel: 0.1 } }) : { unresolved: "no-own-assembly" };
     state.bolts = bolts;
+    state.loadStats = { assemblies: state.asms.length, bolts: bolts.length, slowLookups: slow };
     state.hasLinks = exportHasLinks;
   }
   async function assemblyBoxes() {
@@ -551,7 +578,8 @@
     state.ready = true;
     $("main").hidden = false;
     const site = state.bolts.filter((b) => b.sides && (b.sides.others || []).length).length;
-    setStatus(`${state.asms.length} ${L2("сглобки", "assemblies")} · ${new Set(state.asms.map((a) => a.mark)).size} ${L2("марки", "marks")} · ${state.bolts.length} ${L2("болтови групи", "bolt groups")} (${site} ${L2("между две сглобки", "between two assemblies")})`);
+    setStatus(`${state.asms.length} ${L2("сглобки", "assemblies")} · ${new Set(state.asms.map((a) => a.mark)).size} ${L2("марки", "marks")} · ${state.bolts.length} ${L2("болтови групи", "bolt groups")} (${site} ${L2("между две сглобки", "between two assemblies")})`
+      + (state.loadStats && state.loadStats.slowLookups ? ` · ${L2("бавно търсене", "slow lookups")}: ${state.loadStats.slowLookups}` : ""));
     render();
     if (state.coloured) await applyColours();
   }
