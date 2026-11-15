@@ -116,34 +116,69 @@
     }
     return out.filter((o) => o.guid);
   }
-  async function parentAssembly(modelId, id) {
+  async function parentAssembly(modelId, id, byKey) {
     const ps = (await state.api.viewer.getHierarchyParents(modelId, [id], ELEMENT_ASSEMBLY)) || [];
-    for (const p of ps) { const a = state.byKey.get(key(modelId, p.id)); if (a) return a; }
+    for (const p of ps) { const a = (byKey || state.byKey).get(key(modelId, p.id)); if (a) return a; }
     return null;
   }
+  /** GUID -> runtime id for a chunk; a chunk that fails is split in halves and retried, so one bad GUID or a timeout
+   *  does not drop 500 main parts (review round 2, #12). Result is index-aligned with the chunk (null = not found). */
+  async function toRuntimeIds(modelId, chunk) {
+    try {
+      const r = (await state.api.viewer.convertToObjectRuntimeIds(modelId, chunk)) || [];
+      return chunk.map((_, k) => (r[k] != null ? r[k] : null));
+    } catch (e) {
+      if (chunk.length <= 1) return [null];
+      const h = chunk.length >> 1;
+      return (await toRuntimeIds(modelId, chunk.slice(0, h))).concat(await toRuntimeIds(modelId, chunk.slice(h)));
+    }
+  }
 
-  async function loadModel() {
+  /**
+   * Reads assemblies and bolts of the loaded models. Builds everything into local variables and assigns to state only
+   * at the end; returns false (and changes nothing) when a newer load started meanwhile, e.g. a stage that loads and
+   * unloads models fires several model events while a slow load is still running (review round 2, #3).
+   */
+  async function loadModel(gen) {
+    const stale = () => gen !== loadGen;
     allObjects = null;
     setStatus(L2("Чета сглобките…", "Reading assemblies…"));
-    const asms = await readClass("IfcElementAssembly", /^Assembly/i);
-    state.asms = asms.map((a) => ({ modelId: a.modelId, id: a.id, guid: a.guid, mark: String(val(a.ps, /Assembly_Pos/i) || "").trim(),
-      layer: val(a.ps, /^Layer/i) || "", weight: val(a.ps, /Assembly_Weight/i) || "", finish: val(a.ps, /^Finish/i) || "", parts: [] }));
-    state.byKey = new Map(state.asms.map((a) => [key(a.modelId, a.id), a]));
-    state.byGuid = new Map(state.asms.map((a) => [a.guid, a]));
+    const raw = await readClass("IfcElementAssembly", /^Assembly/i);
+    if (stale()) return false;
+    // the same assembly in two loaded models (overlapping exports, two versions): keep the first, warn (#11)
+    const seenGuid = new Set();
+    let dupAsms = 0;
+    const asms = [];
+    for (const a of raw) {
+      if (seenGuid.has(a.guid)) { dupAsms++; continue; }
+      seenGuid.add(a.guid);
+      asms.push({ modelId: a.modelId, id: a.id, guid: a.guid, mark: String(val(a.ps, /Assembly_Pos/i) || "").trim(),
+        layer: val(a.ps, /^Layer/i) || "", weight: val(a.ps, /Assembly_Weight/i) || "", finish: val(a.ps, /^Finish/i) || "", parts: [] });
+    }
+    const byKey = new Map(asms.map((a) => [key(a.modelId, a.id), a]));
+    const byGuid = new Map(asms.map((a) => [a.guid, a]));
     // children of each assembly (parts and, in Tekla IFC, its bolts): one call per ASSEMBLY, reused below so the bolts
     // need no call each (4000 bolts used to mean ~8000 one-by-one calls; user 15.11.2026)
     const asmOfChild = new Map();   // key(model, child runtime id) -> assembly
-    let doneA = 0;
-    await pool(state.asms, 8, async (a) => {
-      try { a.parts = ((await state.api.viewer.getHierarchyChildren(a.modelId, [a.id], ELEMENT_ASSEMBLY)) || []).map((c) => c.id); } catch { a.parts = []; }
+    let doneA = 0, childErrors = 0;
+    await pool(asms, 8, async (a) => {
+      if (stale()) return;
+      try { a.parts = ((await state.api.viewer.getHierarchyChildren(a.modelId, [a.id], ELEMENT_ASSEMBLY)) || []).map((c) => c.id); }
+      catch { a.parts = []; childErrors++; }
       for (const id of a.parts) asmOfChild.set(key(a.modelId, id), a);
-      if (++doneA % 50 === 0) setStatus(L2(`Чета сглобките… ${doneA} от ${state.asms.length}`, `Reading assemblies… ${doneA} of ${state.asms.length}`));
+      if (++doneA % 50 === 0 && !stale()) setStatus(L2(`Чета сглобките… ${doneA} от ${asms.length}`, `Reading assemblies… ${doneA} of ${asms.length}`));
     });
+    if (stale()) return false;
     setStatus(L2("Чета болтовете…", "Reading bolts…"));
-    const fs = await readClass("IfcMechanicalFastener", /^Bolt/i);
+    const rawBolts = await readClass("IfcMechanicalFastener", /^Bolt/i);
+    if (stale()) return false;
+    // a bolt group loaded twice (two overlapping models) is counted once (#11)
+    const seenBolt = new Set();
+    let dupBolts = 0;
+    const fs = rawBolts.filter((f) => { if (seenBolt.has(f.guid)) { dupBolts++; return false; } seenBolt.add(f.guid); return true; });
     // bolts are not parts: keep them out of the parts lists (colouring)
-    const boltKeys = new Set(fs.map((f) => key(f.modelId, f.id)));
-    for (const a of state.asms) a.parts = a.parts.filter((id) => !boltKeys.has(key(a.modelId, id)));
+    const boltKeys = new Set(rawBolts.map((f) => key(f.modelId, f.id)));
+    for (const a of asms) a.parts = a.parts.filter((id) => !boltKeys.has(key(a.modelId, id)));
     const assemblyOfPart = new Map();
     // main parts: Tekla GUID -> IFC GlobalId -> runtime id, in batches of 500 per model, then its assembly from the map
     const mainByModel = new Map();
@@ -153,27 +188,36 @@
       if (!mainByModel.has(f.modelId)) mainByModel.set(f.modelId, new Set());
       mainByModel.get(f.modelId).add(ifc);
     }
+    const asmModels = [...new Set(asms.map((a) => a.modelId))];
     let slow = 0;   // lookups that still needed a call each (fallback)
     for (const [m, set] of mainByModel) {
-      const guids = [...set];
-      for (let i = 0; i < guids.length; i += 500) {
-        const chunk = guids.slice(i, i + 500);
-        let rts = [];
-        try { rts = (await state.api.viewer.convertToObjectRuntimeIds(m, chunk)) || []; } catch {}
-        const missing = [];
-        chunk.forEach((g, k) => {
-          const a = rts[k] != null ? asmOfChild.get(key(m, rts[k])) : null;
-          if (a) assemblyOfPart.set(g, a.guid); else if (rts[k] != null) missing.push([g, rts[k]]);
-        });
-        await pool(missing, 6, async ([g, rt]) => { slow++; try { const a = await parentAssembly(m, rt); if (a) assemblyOfPart.set(g, a.guid); } catch {} });
+      // the bolt's own model first, then the other loaded models (bolts exported apart from their parts, #11)
+      let todo = [...set];
+      for (const mm of [m].concat(asmModels.filter((x) => x !== m))) {
+        if (!todo.length) break;
+        const notFound = [];
+        for (let i = 0; i < todo.length; i += 500) {
+          const chunk = todo.slice(i, i + 500);
+          const rts = await toRuntimeIds(mm, chunk);
+          if (stale()) return false;
+          const missing = [];
+          chunk.forEach((g, k) => {
+            const a = rts[k] != null ? asmOfChild.get(key(mm, rts[k])) : null;
+            if (a) assemblyOfPart.set(g, a.guid); else if (rts[k] != null) missing.push([g, rts[k]]); else notFound.push(g);
+          });
+          await pool(missing, 6, async ([g, rt]) => { slow++; try { const a = await parentAssembly(mm, rt, byKey); if (a) assemblyOfPart.set(g, a.guid); } catch {} });
+          if (stale()) return false;
+        }
+        todo = notFound;
       }
     }
     const bolts = [];
     let doneB = 0;
     await pool(fs, 6, async (f) => {
+      if (stale()) return;
       let own = asmOfChild.get(key(f.modelId, f.id)) || null;
-      if (!own) { slow++; try { own = await parentAssembly(f.modelId, f.id); } catch { own = null; } }
-      if (++doneB % 200 === 0) setStatus(L2(`Чета болтовете… ${doneB} от ${fs.length}`, `Reading bolts… ${doneB} of ${fs.length}`));
+      if (!own) { slow++; try { own = await parentAssembly(f.modelId, f.id, byKey); } catch { own = null; } }
+      if (++doneB % 200 === 0 && !stale()) setStatus(L2(`Чета болтовете… ${doneB} от ${fs.length}`, `Reading bolts… ${doneB} of ${fs.length}`));
       const hasLinks = Object.keys(f.ps).some((k) => /Main_Part_GUID|Connected_Assemblies/i.test(k));
       const mainPart = String(val(f.ps, /Main_Part_GUID/i) || "").trim();
       const ca = val(f.ps, /Connected_Assemblies/i);
@@ -182,9 +226,10 @@
         kind: String(val(f.ps, /Site_Workshop/i) || "").trim(), assemblyCode: val(f.ps, /Assembly_Code/i) || "", comment: val(f.ps, /^Comment/i) || "",
         name: val(f.ps, /Bolt Name/i) || "", standard: val(f.ps, /^Standard/i) || "", length: val(f.ps, /^Length/i), diameter: val(f.ps, /^Diameter/i), count: val(f.ps, /Bolt count/i) });
     });
+    if (stale()) return false;
     // fallback geometry only for bolts without a usable Main_Part_GUID (old exports)
     const needFallback = bolts.some((b) => b.otherMarks && b.otherMarks.length && !assemblyOfPart.get(L.tcGuidToIfc(b.mainPart)));
-    const assemblies = needFallback ? await assemblyBoxes() : [];
+    const assemblies = needFallback ? await assemblyBoxes(asms) : [];
     if (needFallback) {
       const byModel = new Map();
       for (const b of bolts) { if (!byModel.has(b.modelId)) byModel.set(b.modelId, []); byModel.get(b.modelId).push(b); }
@@ -194,17 +239,21 @@
         list.forEach((b) => { b.bbox = bm.get(b.id); });
       }
     }
+    if (stale()) return false;
     // In an export that has the link properties, bolts without them (anchors) are single-assembly bolts.
     const exportHasLinks = bolts.some((b) => b.otherMarks != null);
     if (exportHasLinks) for (const b of bolts) if (b.otherMarks == null) b.otherMarks = [];
     for (const b of bolts) b.sides = b.ownGuid ? L.resolveSides(b, { assemblyOfPart, assemblies, opts: { abs: 0.2, rel: 0.1 } }) : { unresolved: "no-own-assembly" };
+    // everything at once, so the panel never shows half of one load and half of another
+    state.asms = asms; state.byKey = byKey; state.byGuid = byGuid;
     state.bolts = bolts;
-    state.loadStats = { assemblies: state.asms.length, bolts: bolts.length, slowLookups: slow };
+    state.loadStats = { assemblies: asms.length, bolts: bolts.length, slowLookups: slow, dupAsms, dupBolts, childErrors };
     state.hasLinks = exportHasLinks;
+    return true;
   }
-  async function assemblyBoxes() {
+  async function assemblyBoxes(asms) {
     const out = [];
-    for (const a of state.asms) {
+    for (const a of asms) {
       let boxes = [];
       try { boxes = ((await state.api.viewer.getObjectBoundingBoxes(a.modelId, a.parts.length ? a.parts : [a.id])) || []).map((x) => x.boundingBox).filter(Boolean); } catch {}
       out.push({ guid: a.guid, mark: a.mark, boxes });
@@ -555,8 +604,10 @@
   $("selLang").value = lang;
   $("selLang").onchange = (e) => { lang = e.target.value; try { localStorage.setItem("arsten.assemblyStatus.lang", lang); } catch {} render(); };
 
+  let loadGen = 0;
   async function load() {
-    await loadModel();
+    const gen = ++loadGen;
+    if (!(await loadModel(gen))) return;   // a newer load took over
     clearTimeout(waitTimer);
     if (!state.asms.length && !(allObjects || []).length && waitTries < 30) {
       // no objects yet: the panel opened before a model was loaded, or the model is still streaming in
@@ -575,11 +626,18 @@
         ` [${(allObjects || []).length} obj${seen ? ": " + seen : ""}]`, true); return;
     }
     await loadRecords();
+    if (gen !== loadGen) return;
     state.ready = true;
     $("main").hidden = false;
     const site = state.bolts.filter((b) => b.sides && (b.sides.others || []).length).length;
+    const st = state.loadStats || {};
+    const warn = [];
+    if (st.dupAsms || st.dupBolts) warn.push(L2(`заредени два пъти (припокриващи се модели): ${st.dupAsms} сглобки, ${st.dupBolts} болта – броени веднъж`,
+      `loaded twice (overlapping models): ${st.dupAsms} assemblies, ${st.dupBolts} bolts – counted once`));
+    if (st.childErrors) warn.push(L2(`${st.childErrors} сглобки без прочетени елементи`, `${st.childErrors} assemblies whose parts could not be read`));
     setStatus(`${state.asms.length} ${L2("сглобки", "assemblies")} · ${new Set(state.asms.map((a) => a.mark)).size} ${L2("марки", "marks")} · ${state.bolts.length} ${L2("болтови групи", "bolt groups")} (${site} ${L2("между две сглобки", "between two assemblies")})`
-      + (state.loadStats && state.loadStats.slowLookups ? ` · ${L2("бавно търсене", "slow lookups")}: ${state.loadStats.slowLookups}` : ""));
+      + (st.slowLookups ? ` · ${L2("бавно търсене", "slow lookups")}: ${st.slowLookups}` : "")
+      + (warn.length ? " · ⚠ " + warn.join("; ") : ""), !!warn.length);
     render();
     if (state.coloured) await applyColours();
   }
