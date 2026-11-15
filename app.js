@@ -5,7 +5,7 @@
 // erected / wrong / deliveries for ADMIN + GC; holds for ADMIN + GC + DESIGNERS.
 (() => {
   "use strict";
-  const L = window.SteelLogic, R = window.SteelRecords, A = window.PsetApi;
+  const L = window.SteelLogic, R = window.SteelRecords, A = window.PsetApi, F = window.SteelFab;
   const $ = (id) => document.getElementById(id);
   const BATCH = 200;
   const ELEMENT_ASSEMBLY = 4;   // HierarchyType.ElementAssembly
@@ -14,7 +14,7 @@
     selection: ["Избрано", "Selection"], follow: ["Следи избора в модела", "Follow model selection"], clear: ["Изчисти", "Clear"],
     nothing: ["Нищо не е избрано. Изберете сглобки в модела или марка от таблицата.", "Nothing selected. Select assemblies in the model or a mark in the table."],
     view: ["Изглед", "View"], colour: ["Оцвети по статус", "Colour by status"],
-    marks: ["Марки", "Marks"], deliveries: ["Доставки", "Deliveries"], bolts: ["Болтове", "Bolts"], docs: ["Документи", "Documents"],
+    marks: ["Марки", "Marks"], deliveries: ["Доставки", "Deliveries"], fab: ["Производство", "Fabrication"], bolts: ["Болтове", "Bolts"], docs: ["Документи", "Documents"],
     erected: ["Монтиран", "Erected"], wrong: ["Грешно изработен", "Wrong (fabrication)"], hold: ["Задържан", "On hold"],
     set: ["Отбележи", "Set"], undo: ["Отмени", "Undo"], note: ["Бележка", "Note"], reason: ["Причина", "Reason"],
     noRight: ["Нямате права за това.", "You have no rights for this."],
@@ -37,6 +37,7 @@
     api: null, client: null, project: null, user: "", access: null, lib: null, ready: false,
     asms: [], byKey: new Map(), byGuid: new Map(),   // assembly instances {modelId, id, guid, mark, layer, weight, finish, parts:[runtime ids]}
     bolts: [], status: new Map(), holds: new Map(), deliveries: [],
+    fab: new Map(), fabPlan: null,   // fabrication dates per IFC GUID (fabrication.js); the import waiting for "Save"
     sel: [], coloured: false, tab: "marks", boltScope: "all", follow: true,
   };
   const key = (modelId, id) => modelId + ":" + id;
@@ -300,7 +301,7 @@
     }
     $("setupBox").hidden = true;
     state.lib = found.lib;
-    for (const d of R.definitions()) {
+    for (const d of R.definitions().concat([F.definition()])) {
       try { await state.client.ensureDefinition(state.lib.id, d); }
       catch (e) { if (e.status !== 403) throw e; }   // non-admins cannot create definitions; reading still works
     }
@@ -308,9 +309,13 @@
     const toMap = (m) => new Map([...m].map(([l, p]) => [l.replace(/^frn:entity:/, ""), p]));
     const status = toMap(await state.client.readMany(state.lib.id, R.DEF.status, links));
     const holds = toMap(await state.client.readMany(state.lib.id, R.DEF.hold, links));
+    // fabrication dates: an admin's first visit creates the definition; until then there is nothing to read
+    let fab = new Map();
+    try { fab = toMap(await state.client.readMany(state.lib.id, F.DEF_ID, links)); }
+    catch (e) { if (e.status !== 404 && e.status !== 403) throw e; }
     const dels = await state.client.listAll(state.lib.id, R.DEF.delivery, R.deliveryPrefix(state.project.id));
     if (!current()) return false;
-    state.status = status; state.holds = holds;
+    state.status = status; state.holds = holds; state.fab = fab;
     state.deliveries = [...dels].map(([link, p]) => Object.assign({ link }, p)).sort((a, b) => String(b.date).localeCompare(String(a.date)));
     return true;
   }
@@ -422,13 +427,98 @@
     if (r.lines.length && window.confirm(L2(`Да се запише доставка с ${r.lines.length} марки (${r.lines.reduce((t, l) => t + l.qty, 0)} бр.)?`, `Save a delivery of ${r.lines.length} marks (${r.lines.reduce((t, l) => t + l.qty, 0)} pcs)?`))) await addDelivery(r.lines, file.name);
   }
 
+  // ---------- fabrication import (fabricator's Excel -> AM_Fabrication) ----------
+  const pad2 = (n) => String(n).padStart(2, "0");
+  /** An ExcelJS cell value -> {text, num, date}. Date cells come as JS Dates at UTC midnight. */
+  function excelCell(v) {
+    if (v && typeof v === "object" && !(v instanceof Date)) {
+      if ("result" in v) v = v.result;
+      else if (Array.isArray(v.richText)) v = v.richText.map((r) => r.text).join("");
+      else if ("text" in v) v = v.text;
+      else if ("error" in v) v = "";
+    }
+    if (v instanceof Date) return { text: "", date: `${v.getUTCFullYear()}-${pad2(v.getUTCMonth() + 1)}-${pad2(v.getUTCDate())}` };
+    if (typeof v === "number") return { text: String(v), num: v };
+    return { text: v == null ? "" : String(v) };
+  }
+  /** The fabricator's file -> {sheets: [{name, rows}], date1904}. .xlsx (Excel), or the Tekla export itself (an HTML
+   *  table named .xls, Windows-1251). The old binary .xls and Excel's "web page" save are refused with a clear message. */
+  async function readWorkbook(file) {
+    const buf = await file.arrayBuffer();
+    const b = new Uint8Array(buf.slice(0, 8));
+    if (b[0] === 0x50 && b[1] === 0x4b) {   // zip = .xlsx
+      const ExcelJS = await loadExcelJs();
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.load(buf);
+      const sheets = wb.worksheets.map((ws) => {
+        const rows = [];
+        ws.eachRow({ includeEmpty: true }, (row, n) => { rows[n - 1] = row.values.slice(1).map(excelCell); });
+        for (let i = 0; i < rows.length; i++) rows[i] = rows[i] || [];
+        return { name: wb.worksheets.length > 1 ? ws.name : "", rows };
+      });
+      return { sheets, date1904: !!(wb.properties && wb.properties.date1904) };
+    }
+    if (b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0)
+      throw new Error(L2("Файлът е в стария формат Excel 97-2003. Отворете го в Excel, запишете го като „Excel Workbook (*.xlsx)“ и опитайте пак.",
+        "The file is in the old Excel 97-2003 format. Open it in Excel, save it as \"Excel Workbook (*.xlsx)\" and try again."));
+    const head = new TextDecoder("latin1").decode(buf.slice(0, 2048));
+    const cs = /charset=["']?([\w-]+)/i.exec(head);
+    const html = new TextDecoder(cs ? cs[1] : "windows-1251").decode(buf);
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    if (doc.querySelector("frameset")) throw new Error(L2("Това е Excel „уеб страница“ – данните са в отделна папка. Запишете файла като „Excel Workbook (*.xlsx)“.",
+      "This is an Excel \"web page\" save – the data is in a separate folder. Save the file as \"Excel Workbook (*.xlsx)\"."));
+    const rows = [...doc.querySelectorAll("tr")].map((tr) => [...tr.querySelectorAll("td,th")].map((td) => {
+      const n = td.getAttribute("x:num");
+      const c = { text: td.textContent || "" };
+      if (n != null && n !== "" && isFinite(+n)) c.num = +n;
+      return c;
+    }));
+    return { sheets: [{ name: "", rows }], date1904: false };
+  }
+  async function importFab(file) {
+    state.fabPlan = null;
+    const wb = await readWorkbook(file);
+    const rows = [];
+    let noDates = false;
+    for (const sh of wb.sheets) {
+      const r = F.readSheet(sh.rows, sh.name, L2("ред", "row"));
+      if (r.rows) rows.push(...r.rows); else if (r.error === "noDates") noDates = true;
+    }
+    if (!rows.length) {
+      return setStatus(noDates ? L2("Няма колони „Дата изработен“ / „Дата доставен“.", "No \"Дата изработен\" / \"Дата доставен\" columns.")
+        : L2("Няма колона GUID – това не е файл от отчета AM_Fabrication.", "No GUID column – this is not a file from the AM_Fabrication report."), true);
+    }
+    const known = new Map(state.asms.map((a) => [a.guid, { mark: a.mark }]));
+    state.fabPlan = { source: file.name, p: F.plan(rows, { toIfc: L.tcGuidToIfc, known, existing: state.fab, date1904: wb.date1904 }) };
+    state.tab = "fab";
+    setStatus(L2(`Прочетен ${file.name}: проверете промените и натиснете „Запиши“.`, `Read ${file.name}: check the changes and press "Save".`));
+    render();
+  }
+  async function applyFab() {
+    const fp = state.fabPlan;
+    if (!fp) return;
+    if (!state.lib) return setStatus(L2("Няма библиотека STEEL/Монтаж.", "No library STEEL/Монтаж."), true);
+    if (!can("status")) return setStatus(t("noRight"), true);
+    let done = 0, failed = 0, first = "";
+    await pool(fp.p.changes, 6, async (c) => {
+      const next = F.nextRecord(state.fab.get(c.ifc), c, { source: fp.source, by: state.user });
+      try { await state.client.write(state.lib.id, F.DEF_ID, "frn:entity:" + c.ifc, next); state.fab.set(c.ifc, next); done++; }
+      catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
+      if ((done + failed) % 25 === 0) setStatus(L2(`Записвам… ${done + failed} от ${fp.p.changes.length}`, `Saving… ${done + failed} of ${fp.p.changes.length}`));
+    });
+    state.fabPlan = failed ? state.fabPlan : null;
+    setStatus(L2(`Записани ${done} сглобки.`, `Saved ${done} assemblies.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
+      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failed > 0);
+    render();
+  }
+
   // ---------- rendering ----------
   function render() {
     $("title").textContent = t("title");
     $("hSel").textContent = t("selection"); $("lblFollow").textContent = t("follow"); $("btnSelClear").textContent = t("clear");
     $("hView").textContent = t("view"); $("lblColour").textContent = t("colour");
     document.querySelectorAll("#tabs button").forEach((b) => { b.textContent = t(b.dataset.tab); b.classList.toggle("on", b.dataset.tab === state.tab); });
-    ["marks", "deliveries", "bolts", "docs"].forEach((k) => { $("tab-" + k).hidden = state.tab !== k; });
+    ["marks", "deliveries", "fab", "bolts", "docs"].forEach((k) => { $("tab-" + k).hidden = state.tab !== k; });
     $("legend").innerHTML = L.STATES.map((s) => `<span><span class="sw" style="background:${s.colour}"></span>${esc(lang === "bg" ? s.bg : s.en)}</span>`).join("");
     if (!state.ready) return;
     const av = avail();
@@ -440,7 +530,12 @@
       for (const a of sel) byMark.set(a.mark, (byMark.get(a.mark) || 0) + 1);
       const states = new Map();
       for (const a of sel) { const s = av.state.get(a.guid); states.set(s, (states.get(s) || 0) + 1); }
-      $("selText").innerHTML = `<b>${sel.length}</b> ${L2("сглобки", "assemblies")} · ${esc([...byMark].map(([m, n]) => (n > 1 ? `${m} (${n})` : m)).join(", "))}<div class="sub">${[...states].map(([s, n]) => `${esc(stateName(s))}: ${n}`).join(" · ")}</div>`;
+      const fb = sel.map((a) => state.fab.get(a.guid) || {});
+      const fabLine = sel.length === 1
+        ? [fb[0].FabDate && `${L2("изработен", "fabricated")} ${fmtDate(fb[0].FabDate)}`, fb[0].DelivDate && `${L2("доставен", "delivered")} ${fmtDate(fb[0].DelivDate)}`, fb[0].DelivNote && `${L2("СР", "DN")} ${fb[0].DelivNote}`].filter(Boolean).join(" · ")
+        : [fb.some((x) => x.FabDate) && `${L2("изработени", "fabricated")} ${fb.filter((x) => x.FabDate).length}`, fb.some((x) => x.DelivDate) && `${L2("доставени (Excel)", "delivered (Excel)")} ${fb.filter((x) => x.DelivDate).length}`].filter(Boolean).join(" · ");
+      $("selText").innerHTML = `<b>${sel.length}</b> ${L2("сглобки", "assemblies")} · ${esc([...byMark].map(([m, n]) => (n > 1 ? `${m} (${n})` : m)).join(", "))}<div class="sub">${[...states].map(([s, n]) => `${esc(stateName(s))}: ${n}`).join(" · ")}</div>`
+        + (fabLine ? `<div class="sub">${esc(L2("Производство", "Fabrication"))}: ${esc(fabLine)}</div>` : "");
     }
     // actions
     const has = (store, kind) => sel.filter((a) => (store.get(a.guid) || {})[kind]).length;
@@ -453,7 +548,41 @@
     $("acts").innerHTML = act("erected", "#2E7D32", state.status, can("status"), false, t("note"))
       + act("wrong", "#C62828", state.status, can("status"), true, t("note"))
       + act("hold", "#7B1FA2", state.holds, can("hold"), true, t("reason"));
-    renderMarks(av); renderDeliveries(); renderBolts(); renderDocs(av);
+    renderMarks(av); renderDeliveries(); renderFab(); renderBolts(); renderDocs(av);
+  }
+
+  function renderFab() {
+    const right = can("status");
+    const total = state.asms.length;
+    const fabN = state.asms.filter((a) => (state.fab.get(a.guid) || {}).FabDate).length;
+    const delN = state.asms.filter((a) => (state.fab.get(a.guid) || {}).DelivDate).length;
+    const fp = state.fabPlan;
+    const list = (title, items, cls) => (items.length ? `<div class="${cls || "warn"}"><b>${esc(title)}</b> (${items.length}): ${esc(items.slice(0, 12).join(" · "))}${items.length > 12 ? " …" : ""}</div>` : "");
+    let preview = "";
+    if (fp) {
+      const p = fp.p;
+      const over = p.changes.filter((c) => c.over.length);
+      const fname = (f) => ({ FabDate: L2("изработен", "fabricated"), DelivDate: L2("доставен", "delivered"), DelivNote: L2("СР", "DN") }[f] || f);
+      const show = (f, v) => (f === "DelivNote" ? v : fmtDate(v));
+      preview = `<div class="box" style="margin-top:6px"><div><b>${esc(fp.source)}</b></div>
+        <div class="sub">${p.rows} ${L2("реда", "rows")} · ${p.guids} ${L2("сглобки с данни", "assemblies with data")} · ${L2("нови стойности", "new values")} <b>${p.fills}</b> · ${L2("промени на въведени", "changes to stored")} <b>${p.overwrites}</b> · ${L2("без промяна", "unchanged")} ${p.unchanged}</div>
+        ${over.length ? `<div class="warn"><b>${esc(L2("Ще се променят вече въведени стойности", "Stored values that will change"))}</b> (${over.length}):<br>${over.slice(0, 15).map((c) => esc(`${c.mark}: ` + c.over.map((o) => `${fname(o.field)} ${show(o.field, o.from)} → ${show(o.field, o.to)}`).join(", "))).join("<br>")}${over.length > 15 ? "<br>…" : ""}</div>` : ""}
+        ${list(L2("Неразпознати дати (пропуснати)", "Dates not understood (skipped)"), p.problems)}
+        ${list(L2("Проверете (ДД/ММ или ММ/ДД?)", "Check (DD/MM or MM/DD?)"), p.warnings)}
+        ${list(L2("Една сглобка с различни стойности", "One assembly with different values"), p.conflicts)}
+        ${list(L2("Не са в заредения модел (не се записват)", "Not in the loaded model (not saved)"), p.notLoaded)}
+        ${list(L2("Невалиден GUID", "Invalid GUID"), p.badGuid)}
+        <div class="bar"><button class="small" data-act="fabApply" ${p.changes.length && right ? "" : "disabled"}>${esc(L2(`Запиши (${p.changes.length} сглобки)`, `Save (${p.changes.length} assemblies)`))}</button>
+          <button class="small secondary" data-act="fabCancel">${esc(L2("Откажи", "Cancel"))}</button>${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div></div>`;
+    }
+    $("tab-fab").innerHTML = `<div class="box">
+        <div>${L2("Изработени", "Fabricated")}: <b>${fabN}</b> · ${L2("Доставени", "Delivered")}: <b>${delN}</b> / ${total}</div>
+        <div class="bar"><label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel от производителя", "Import the fabricator's Excel")}<input type="file" id="fabFile" accept=".xlsx,.xls,.htm,.html" hidden></label>
+          ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div>
+        <div class="sub">${esc(L2("Файлът от отчета AM_Fabrication с попълнени оранжеви колони. Сглобките се разпознават по GUID. Празна клетка не изтрива дата. Tekla чете датите като ASSEMBLY.PSET.AM_Fabrication.* след „Synchronize property sets“.",
+          "The AM_Fabrication report file with the orange columns filled. Assemblies are matched by GUID. An empty cell never clears a date. Tekla reads the dates as ASSEMBLY.PSET.AM_Fabrication.* after \"Synchronize property sets\"."))}</div></div>${preview}`;
+    const f = $("fabFile");
+    if (f) f.onchange = (e) => guarded(async () => { const file = e.target.files[0]; e.target.value = ""; if (file) await importFab(file); });
   }
 
   function renderMarks(av) {
@@ -621,6 +750,8 @@
       else if (act === "dlvAdd") await addDelivery(R.parseDeliveryText($("dlvText").value).lines, "typed");
       else if (act === "dlvCancel") await cancelDelivery(+b.dataset.i);
       else if (act === "dlvCancelNo") { state.cancelling = null; render(); }
+      else if (act === "fabApply") await applyFab();
+      else if (act === "fabCancel") { state.fabPlan = null; setStatus(L2("Импортът е отказан.", "Import cancelled.")); render(); }
       else if (act === "boltXlsx") await exportBoltsXlsx();
       else if (act === "boltPdf") exportBoltsPdf();
       else if (act === "docErected") await exportErected();
