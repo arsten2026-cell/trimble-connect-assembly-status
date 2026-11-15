@@ -17,7 +17,7 @@
   function def(id, name, fields) {
     const props = {}, labels = {}, order = {};
     fields.forEach(([k, schema, label], i) => { props[k] = schema; labels[k] = label; order[k] = String(i); });
-    return { id, name, description: "Arsten Assembly status extension.", schema: { props },
+    return { id, name, description: "Arsten / Multiplan Assembly status extension.", schema: { props },
       i18n: { "en-US": { name, props: labels }, "__prop-order__": { name: "__prop-order__", props: order } } };
   }
   const S = { type: "string" }, B = { type: "boolean" }, D = { type: "string", format: "date" };

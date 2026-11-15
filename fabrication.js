@@ -14,7 +14,7 @@
   const DEF_ID = "fabstatus";
   const PSET = "AM_Fabrication";
   const NOTE_MAX = 79;   // the report's note column and the old Tekla UDA hold 79 characters
-  const LOG_MAX = 4000;
+  const LOG_MAX = 1500;   // the pset service's string limit is not documented: keep the history short (round 5, L9)
   const FIELDS = ["FabDate", "DelivDate", "DelivNote"];
 
   /** Definition in the Connect library-editor format. Names and labels are the bare property names on purpose:
@@ -24,7 +24,7 @@
     const fields = [["FabDate", D], ["DelivDate", D], ["DelivNote", S], ["Source", S], ["log", S]];
     const props = {}, labels = {}, order = {};
     fields.forEach(([k, schema], i) => { props[k] = schema; labels[k] = k; order[k] = String(i); });
-    return { id: DEF_ID, name: PSET, description: "Arsten fabrication: dates from the fabricator's Excel (Tekla reads PSET.AM_Fabrication.*).",
+    return { id: DEF_ID, name: PSET, description: "Arsten / Multiplan fabrication: dates from the fabricator's Excel (Tekla reads PSET.AM_Fabrication.*).",
       schema: { props }, i18n: { "en-US": { name: PSET, props: labels }, "__prop-order__": { name: "__prop-order__", props: order } } };
   }
 
@@ -132,7 +132,9 @@
       }
       if (r.note) {
         let n = clean(r.note.text);
-        if (n.length > NOTE_MAX) { warnings.push(`${r.where} (${r.mark || "?"}): ${n.length} > ${NOTE_MAX}`); n = n.slice(0, NOTE_MAX); }
+        // trimmed after the cut, so a cut at a space does not store a trailing space that the next round trip
+        // through Tekla drops and reports as a change (round 5, L1)
+        if (n.length > NOTE_MAX) { warnings.push(`${r.where} (${r.mark || "?"}): ${n.length} > ${NOTE_MAX}`); n = n.slice(0, NOTE_MAX).trim(); }
         if (n) vals.DelivNote = n;
       }
       if (!Object.keys(vals).length) continue;
@@ -152,28 +154,46 @@
       const set = {}, over = [];
       for (const f of FIELDS) {
         if (m[f] == null) continue;
-        const was = cur[f] == null ? "" : String(cur[f]).slice(0, f === "DelivNote" ? undefined : 10);
+        const was = stored(f, cur[f]);
         if (was === m[f]) { unchanged++; continue; }
         set[f] = m[f];
         if (was) { overwrites++; over.push({ field: f, from: was, to: m[f] }); } else fills++;
       }
-      if (Object.keys(set).length) changes.push({ ifc, mark: (known.get(ifc) || {}).mark || m.mark, set, over });
+      // before = the stored record the preview was computed from; Save re-reads and compares (round 5, M2 / L4)
+      if (Object.keys(set).length) changes.push({ ifc, mark: (known.get(ifc) || {}).mark || m.mark, set, over, before: cur });
     }
     return { rows: rows.length, guids: merged.size, changes, fills, overwrites, unchanged, problems, warnings, conflicts, notLoaded, badGuid };
+  }
+
+  /** A stored value as the import compares it: dates as "YYYY-MM-DD" in local time (a date-time such as
+   *  "2026-11-14T22:00:00Z" is 15.11 in Bulgaria, round 5, L2), notes cleaned the same way the file is read. */
+  function stored(f, v) {
+    if (v == null || v === "") return "";
+    if (f === "DelivNote") return clean(v);
+    const s = String(v);
+    if (/^\d{4}-\d\d-\d\d$/.test(s)) return s;
+    const t = new Date(s);
+    return isNaN(t) ? s.slice(0, 10) : ymd(t.getFullYear(), t.getMonth() + 1, t.getDate());
   }
 
   function addLog(log, line) {
     const s = (log ? log + "\n" : "") + line;
     return s.length > LOG_MAX ? s.slice(s.length - LOG_MAX).replace(/^[^\n]*\n/, "") : s;
   }
-  /** The record to store: the old one with the new values, the source file and a history line. */
-  function nextRecord(cur, change, meta) {
+  /** What to PATCH: only the changed fields, the source file and the history line built on the record as it is
+   *  stored NOW (cur = a fresh read). Fields not in the change are left out, so a value someone else wrote since the
+   *  panel loaded is never sent back stale (round 5, M2). */
+  function patchFor(cur, change, meta) {
     const m = meta || {};
     const x = m.now || new Date();
     const stamp = `${x.getFullYear()}-${pad(x.getMonth() + 1)}-${pad(x.getDate())} ${pad(x.getHours())}:${pad(x.getMinutes())}`;
     const what = Object.entries(change.set).map(([f, v]) => `${f}=${v}`).join(", ");
-    return Object.assign({}, cur || {}, change.set, { Source: m.source || "", log: addLog((cur || {}).log, `${stamp} ${what} (${m.source || "?"}, ${m.by || "?"})`) });
+    return Object.assign({}, change.set, { Source: m.source || "", log: addLog((cur || {}).log, `${stamp} ${what} (${m.source || "?"}, ${m.by || "?"})`) });
+  }
+  /** Fields of a change whose stored value is no longer what the preview showed (someone saved in between). */
+  function changedSince(change, previewCur, freshCur) {
+    return Object.keys(change.set).filter((f) => stored(f, (previewCur || {})[f]) !== stored(f, (freshCur || {})[f]));
   }
 
-  return { DEF_ID, PSET, FIELDS, NOTE_MAX, definition, parseDate, fromSerial, readSheet, plan, nextRecord };
+  return { DEF_ID, PSET, FIELDS, NOTE_MAX, definition, parseDate, fromSerial, readSheet, plan, stored, patchFor, changedSince };
 });

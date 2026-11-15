@@ -37,13 +37,14 @@
     api: null, client: null, project: null, user: "", access: null, lib: null, ready: false,
     asms: [], byKey: new Map(), byGuid: new Map(),   // assembly instances {modelId, id, guid, mark, layer, weight, finish, parts:[runtime ids]}
     bolts: [], status: new Map(), holds: new Map(), deliveries: [],
-    fab: new Map(), fabPlan: null,   // fabrication dates per IFC GUID (fabrication.js); the import waiting for "Save"
+    fab: new Map(), fabPlan: null, fabMs: false,   // fabMs: TEST (15.11.2026) - write under the MS-form GUID link, see msLink   // fabrication dates per IFC GUID (fabrication.js); the import waiting for "Save"
     sel: [], coloured: false, tab: "marks", boltScope: "all", follow: true,
   };
   const key = (modelId, id) => modelId + ":" + id;
   const can = (what) => {
     const r = state.access && state.access.role;
     if (window.ARSTEN_DEMO) return true;
+    if (what === "fab") what = "status";   // fabrication import: same people as statuses for now; a fabricator group later (round 5, L10)
     return what === "hold" ? ["admin", "gc", "designer"].includes(r) : ["admin", "gc"].includes(r);
   };
 
@@ -301,7 +302,7 @@
     }
     $("setupBox").hidden = true;
     state.lib = found.lib;
-    for (const d of R.definitions().concat([F.definition()])) {
+    for (const d of R.definitions()) {
       try { await state.client.ensureDefinition(state.lib.id, d); }
       catch (e) { if (e.status !== 403) throw e; }   // non-admins cannot create definitions; reading still works
     }
@@ -309,13 +310,18 @@
     const toMap = (m) => new Map([...m].map(([l, p]) => [l.replace(/^frn:entity:/, ""), p]));
     const status = toMap(await state.client.readMany(state.lib.id, R.DEF.status, links));
     const holds = toMap(await state.client.readMany(state.lib.id, R.DEF.hold, links));
-    // fabrication dates: an admin's first visit creates the definition; until then there is nothing to read
-    let fab = new Map();
-    try { fab = toMap(await state.client.readMany(state.lib.id, F.DEF_ID, links)); }
-    catch (e) { if (e.status !== 404 && e.status !== 403) throw e; }
+    // fabrication dates: an admin's first visit creates the definition; until then there is nothing to read. Any
+    // error here only disables the Производство tab, never the rest of Стомана (round 5, M3)
+    let fab = new Map(), fabError = "";
+    try {
+      try { await state.client.ensureDefinition(state.lib.id, F.definition()); } catch (e) { if (e.status !== 403) throw e; }
+      fab = toMap(await state.client.readMany(state.lib.id, F.DEF_ID, links));
+    } catch (e) {
+      if (e.status !== 404) { fabError = errText(e); console.warn("fabrication dates not available", e); }
+    }
     const dels = await state.client.listAll(state.lib.id, R.DEF.delivery, R.deliveryPrefix(state.project.id));
     if (!current()) return false;
-    state.status = status; state.holds = holds; state.fab = fab;
+    state.status = status; state.holds = holds; state.fab = fab; state.fabError = fabError;
     state.deliveries = [...dels].map(([link, p]) => Object.assign({ link }, p)).sort((a, b) => String(b.date).localeCompare(String(a.date)));
     return true;
   }
@@ -435,7 +441,7 @@
       if ("result" in v) v = v.result;
       else if (Array.isArray(v.richText)) v = v.richText.map((r) => r.text).join("");
       else if ("text" in v) v = v.text;
-      else if ("error" in v) v = "";
+      else v = "";   // an error value, or a formula without a cached result (round 5, L6)
     }
     if (v instanceof Date) return { text: "", date: `${v.getUTCFullYear()}-${pad2(v.getUTCMonth() + 1)}-${pad2(v.getUTCDate())}` };
     if (typeof v === "number") return { text: String(v), num: v };
@@ -475,40 +481,74 @@
     }));
     return { sheets: [{ name: "", rows }], date1904: false };
   }
+  // TEST (15.11.2026): records linked by the IFC GUID are not shown by Connect's own panel or Tekla when the GUID holds a "$".
+  // The admin switch writes the same record under the MS-form GUID ("03b0caff-a82e-...") to see whether those consumers use it.
+  const IFC64 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
+  function ifcToMs(g) {
+    let n = 0n;
+    for (const ch of String(g)) { const v = IFC64.indexOf(ch); if (v < 0) return ""; n = n * 64n + BigInt(v); }
+    const h = n.toString(16).padStart(32, "0");
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+  }
+  const fabLink = (ifc) => "frn:entity:" + (state.fabMs ? ifcToMs(ifc) : ifc);
+
   async function importFab(file) {
     state.fabPlan = null;
     const wb = await readWorkbook(file);
-    const rows = [];
+    const rows = [], skipped = [];
     let noDates = false;
     for (const sh of wb.sheets) {
       const r = F.readSheet(sh.rows, sh.name, L2("ред", "row"));
-      if (r.rows) rows.push(...r.rows); else if (r.error === "noDates") noDates = true;
+      if (r.rows) rows.push(...r.rows);
+      else { if (r.error === "noDates") noDates = true; if (sh.name) skipped.push(sh.name); }
     }
     if (!rows.length) {
       return setStatus(noDates ? L2("Няма колони „Дата изработен“ / „Дата доставен“.", "No \"Дата изработен\" / \"Дата доставен\" columns.")
         : L2("Няма колона GUID – това не е файл от отчета AM_Fabrication.", "No GUID column – this is not a file from the AM_Fabrication report."), true);
     }
     const known = new Map(state.asms.map((a) => [a.guid, { mark: a.mark }]));
-    state.fabPlan = { source: file.name, p: F.plan(rows, { toIfc: L.tcGuidToIfc, known, existing: state.fab, date1904: wb.date1904 }) };
+    state.fabPlan = { source: file.name, p: F.plan(rows, { toIfc: L.tcGuidToIfc, known, existing: state.fabMs ? new Map() : state.fab, date1904: wb.date1904 }) };
     state.tab = "fab";
-    setStatus(L2(`Прочетен ${file.name}: проверете промените и натиснете „Запиши“.`, `Read ${file.name}: check the changes and press "Save".`));
+    setStatus(L2(`Прочетен ${file.name}: проверете промените и натиснете „Запиши“.`, `Read ${file.name}: check the changes and press "Save".`)
+      + (skipped.length ? L2(` Пропуснати листове (без GUID / дати): `, ` Sheets skipped (no GUID / dates): `) + skipped.join(", ") : ""), skipped.length > 0);   // round 5, L5
     render();
   }
   async function applyFab() {
     const fp = state.fabPlan;
     if (!fp) return;
     if (!state.lib) return setStatus(L2("Няма библиотека STEEL/Монтаж.", "No library STEEL/Монтаж."), true);
-    if (!can("status")) return setStatus(t("noRight"), true);
-    let done = 0, failed = 0, first = "";
+    if (!can("fab")) return setStatus(t("noRight"), true);
+    // Each assembly is read fresh and written with its version: only the changed fields go out (never a stale copy of
+    // the others), and an assembly someone else changed since the preview is skipped, not overwritten (round 5, M2/L4)
+    let done = 0, first = "";
+    const failedList = [], meanwhile = [];
     await pool(fp.p.changes, 6, async (c) => {
-      const next = F.nextRecord(state.fab.get(c.ifc), c, { source: fp.source, by: state.user });
-      try { await state.client.write(state.lib.id, F.DEF_ID, "frn:entity:" + c.ifc, next); state.fab.set(c.ifc, next); done++; }
-      catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
-      if ((done + failed) % 25 === 0) setStatus(L2(`Записвам… ${done + failed} от ${fp.p.changes.length}`, `Saving… ${done + failed} of ${fp.p.changes.length}`));
+      const link = fabLink(c.ifc);
+      try {
+        for (let attempt = 0; ; attempt++) {
+          const cur = await state.client.readOne(state.lib.id, F.DEF_ID, link);
+          const fresh = (cur && cur.props) || {};
+          if (F.changedSince(c, c.before, fresh).length) { meanwhile.push(c.mark || c.ifc); state.fab.set(c.ifc, fresh); return; }
+          const patch = F.patchFor(fresh, c, { source: fp.source, by: state.user });
+          try { await state.client.writeIfUnchanged(state.lib.id, F.DEF_ID, link, patch, cur ? cur.v : undefined); }
+          catch (e) { if ((e.status === 412 || e.status === 409) && attempt < 3) continue; throw e; }
+          if (!state.fabMs) state.fab.set(c.ifc, Object.assign({}, fresh, patch));
+          done++;
+          return;
+        }
+      } catch (e) { failedList.push(c); if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
+      finally { const n = done + failedList.length + meanwhile.length; if (n % 25 === 0) setStatus(L2(`Записвам… ${n} от ${fp.p.changes.length}`, `Saving… ${n} of ${fp.p.changes.length}`)); }
     });
-    state.fabPlan = failed ? state.fabPlan : null;
-    setStatus(L2(`Записани ${done} сглобки.`, `Saved ${done} assemblies.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
-      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failed > 0);
+    // only what failed stays in the preview, so "Save" again does not rewrite (and re-log) what is already saved (L3)
+    if (failedList.length) {
+      fp.p.changes = failedList;
+      fp.p.overwrites = failedList.reduce((n, c) => n + c.over.length, 0);
+      fp.p.fills = failedList.reduce((n, c) => n + Object.keys(c.set).length, 0) - fp.p.overwrites;
+    } else state.fabPlan = null;
+    setStatus(L2(`Записани ${done} сглобки.`, `Saved ${done} assemblies.`)
+      + (meanwhile.length ? L2(` · ${meanwhile.length} променени междувременно от друг – не са записани, импортирайте файла пак: `, ` · ${meanwhile.length} changed by someone else meanwhile – not saved, import the file again: `) + meanwhile.slice(0, 10).join(", ") + "." : "")
+      + (failedList.length ? ` · ${failedList.length} ${L2("грешки", "failed")} (${first})` : "")
+      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failedList.length + meanwhile.length > 0);
     render();
   }
 
@@ -552,7 +592,7 @@
   }
 
   function renderFab() {
-    const right = can("status");
+    const right = can("fab") && !state.fabError;
     const total = state.asms.length;
     const fabN = state.asms.filter((a) => (state.fab.get(a.guid) || {}).FabDate).length;
     const delN = state.asms.filter((a) => (state.fab.get(a.guid) || {}).DelivDate).length;
@@ -575,12 +615,15 @@
         <div class="bar"><button class="small" data-act="fabApply" ${p.changes.length && right ? "" : "disabled"}>${esc(L2(`Запиши (${p.changes.length} сглобки)`, `Save (${p.changes.length} assemblies)`))}</button>
           <button class="small secondary" data-act="fabCancel">${esc(L2("Откажи", "Cancel"))}</button>${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div></div>`;
     }
-    $("tab-fab").innerHTML = `<div class="box">
+    $("tab-fab").innerHTML = (state.fabError ? `<div class="warn">${esc(L2("Датите за производство не могат да се прочетат: ", "Fabrication dates cannot be read: ") + state.fabError)}</div>` : "") + `<div class="box">
         <div>${L2("Изработени", "Fabricated")}: <b>${fabN}</b> · ${L2("Доставени", "Delivered")}: <b>${delN}</b> / ${total}</div>
         <div class="bar"><label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel от производителя", "Import the fabricator's Excel")}<input type="file" id="fabFile" accept=".xlsx,.xls,.htm,.html" hidden></label>
           ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div>
+        ${state.access && state.access.role === "admin" ? `<label class="chk"><input type="checkbox" id="fabMs" ${state.fabMs ? "checked" : ""}> ${esc(L2("Тест: запис с GUID (MS)", "Test: write with GUID (MS)"))}</label>` : ""}
         <div class="sub">${esc(L2("Файлът от отчета AM_Fabrication с попълнени оранжеви колони. Сглобките се разпознават по GUID. Празна клетка не изтрива дата. Tekla чете датите като ASSEMBLY.PSET.AM_Fabrication.* след „Synchronize property sets“.",
           "The AM_Fabrication report file with the orange columns filled. Assemblies are matched by GUID. An empty cell never clears a date. Tekla reads the dates as ASSEMBLY.PSET.AM_Fabrication.* after \"Synchronize property sets\"."))}</div></div>${preview}`;
+    const ms = $("fabMs");
+    if (ms) ms.onchange = (e) => { state.fabMs = e.target.checked; state.fabPlan = null; render(); };
     const f = $("fabFile");
     if (f) f.onchange = (e) => guarded(async () => { const file = e.target.files[0]; e.target.value = ""; if (file) await importFab(file); });
   }
@@ -673,7 +716,7 @@
     const rows = r.header.map((h, i) => ({ values: h, bold: i === 0 || i === r.header.length - 1 }));
     rows.push({ values: ["", "Bolt", "Connected To", "Site/Workshop", "Comment"], bold: true, fill: "FFECE8DF" });
     for (const x of r.rows) rows.push(x.type === "mark" ? { values: [`Marked ${x.mark}`], bold: true } : { values: ["", x.line, x.connected, x.kind, x.comment] });
-    rows.push({ values: [] }, { values: ["Generated from Trimble Connect by Multiplan (Arsten Assembly status)"] });
+    rows.push({ values: [] }, { values: ["Generated from Trimble Connect by Arsten / Multiplan (Assembly status)"] });
     await saveXlsx("bolt-location-list", [{ name: "Bolt Location List", rows, widths: [16, 40, 28, 14, 30] }]);
   }
   function exportBoltsPdf() {
@@ -689,7 +732,7 @@
       <p><b>${h(r.header[r.header.length - 1][0])}</b></p>
       <table><thead><tr><th></th><th>Bolt</th><th>Connected To</th><th>Site/Workshop</th><th>Comment</th></tr></thead><tbody>
       ${r.rows.map((x) => (x.type === "mark" ? `<tr class="mk"><td colspan="5">Marked ${h(x.mark)}</td></tr>` : `<tr><td></td><td>${h(x.line)}</td><td>${h(x.connected)}</td><td>${h(x.kind)}</td><td>${h(x.comment)}</td></tr>`)).join("")}
-      </tbody></table><div class="foot">Generated from Trimble Connect by Multiplan (Arsten Assembly status)</div></body></html>`;
+      </tbody></table><div class="foot">Generated from Trimble Connect by Arsten / Multiplan (Assembly status)</div></body></html>`;
     const f = document.createElement("iframe");
     f.style.cssText = "position:fixed;width:0;height:0;border:0;right:0;bottom:0";
     document.body.appendChild(f);
