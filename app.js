@@ -64,21 +64,24 @@
 
   // Every object of the loaded models with its class (read once; used when the native class filter returns nothing,
   // which happens in Connect for some exports, and for assemblies that only exist as hierarchy nodes).
+  // allObjects: the last finished load's list (shown in the "no assemblies" diagnostics). Each load reads into its own
+  // ctx.all, so two overlapping loads never share or reset one list (review round 3, M3).
   let allObjects = null;
-  async function readAll() {
-    if (allObjects) return allObjects;
-    const api = state.api;
-    allObjects = [];
+  async function readAll(ctx) {
+    if (ctx.all) return ctx.all;
+    const api = state.api, all = [];
     for (const m of (await api.viewer.getObjects()) || []) {
       const ids = (m.objects || []).map((o) => o.id);
       for (let i = 0; i < ids.length; i += BATCH) {
-        for (const p of (await api.viewer.getObjectProperties(m.modelId, ids.slice(i, i + BATCH))) || []) allObjects.push({ modelId: m.modelId, id: p.id, cls: String(p.class || "") });
+        if (ctx.stale()) return all;
+        for (const p of (await api.viewer.getObjectProperties(m.modelId, ids.slice(i, i + BATCH))) || []) all.push({ modelId: m.modelId, id: p.id, cls: String(p.class || "") });
         setStatus(L2(`Чета модела… ${Math.min(i + BATCH, ids.length)} от ${ids.length}`, `Reading the model… ${Math.min(i + BATCH, ids.length)} of ${ids.length}`));
       }
     }
-    return allObjects;
+    ctx.all = all;
+    return all;
   }
-  async function idsOfClass(cls) {
+  async function idsOfClass(cls, ctx) {
     const api = state.api;
     let models = [];
     try { models = (await api.viewer.getObjects({ parameter: { class: cls } })) || []; } catch {}
@@ -86,13 +89,14 @@
     if (found.length) return found;
     const re = new RegExp(`^${cls}$`, "i");
     const byModel = new Map();
-    for (const o of await readAll()) if (re.test(o.cls)) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.id); }
+    for (const o of await readAll(ctx)) if (re.test(o.cls)) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.id); }
     if (!byModel.size && /elementassembly/i.test(cls)) {
       // assemblies as parents of the parts (as in Cast unit tags)
-      const all = (await readAll()).filter((o) => !/elementassembly/i.test(o.cls));
+      const all = (await readAll(ctx)).filter((o) => !/elementassembly/i.test(o.cls));
       const seen = new Set();
       let done = 0;
       await pool(all, 8, async (o) => {
+        if (ctx.stale()) return;
         try {
           const ps = (await api.viewer.getHierarchyParents(o.modelId, [o.id], ELEMENT_ASSEMBLY)) || [];
           for (const p of ps) { const k = key(o.modelId, p.id); if (!seen.has(k)) { seen.add(k); if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(p.id); } }
@@ -103,11 +107,12 @@
     return [...byModel].map(([modelId, ids]) => ({ modelId, ids }));
   }
 
-  async function readClass(cls, psetRe) {
+  async function readClass(cls, psetRe, ctx) {
     const api = state.api, out = [];
-    for (const m of await idsOfClass(cls)) {
+    for (const m of await idsOfClass(cls, ctx)) {
       const ids = m.ids;
       for (let i = 0; i < ids.length; i += BATCH) {
+        if (ctx.stale()) return [];
         const chunk = ids.slice(i, i + BATCH);
         const props = (await api.viewer.getObjectProperties(m.modelId, chunk)) || [];
         const guids = (await api.viewer.convertToObjectIds(m.modelId, chunk)) || [];
@@ -122,15 +127,28 @@
     return null;
   }
   /** GUID -> runtime id for a chunk; a chunk that fails is split in halves and retried, so one bad GUID or a timeout
-   *  does not drop 500 main parts (review round 2, #12). Result is index-aligned with the chunk (null = not found). */
-  async function toRuntimeIds(modelId, chunk) {
+   *  does not drop 500 main parts (review round 2, #12). Result is index-aligned with the chunk (null = not found).
+   *  Bounded (review round 3, M8): stops halving below 32 GUIDs (those count as failed), stops at once when the load
+   *  is stale, and ctx.failed counts the GUIDs that could not be asked so the caller can give up on a dead model. */
+  async function toRuntimeIds(modelId, chunk, ctx) {
+    if (ctx.stale()) return chunk.map(() => null);
     try {
       const r = (await state.api.viewer.convertToObjectRuntimeIds(modelId, chunk)) || [];
       return chunk.map((_, k) => (r[k] != null ? r[k] : null));
     } catch (e) {
-      if (chunk.length <= 1) return [null];
+      if (chunk.length <= 32) {
+        // one by one, once: a single bad GUID must not drop its good neighbours (review round 4, M3)
+        const out = [];
+        for (const g of chunk) {
+          if (ctx.stale()) { out.push(null); continue; }
+          try { const r = (await state.api.viewer.convertToObjectRuntimeIds(modelId, [g])) || []; out.push(r[0] != null ? r[0] : null); }
+          catch { ctx.failed++; out.push(null); }
+        }
+        return out;
+      }
       const h = chunk.length >> 1;
-      return (await toRuntimeIds(modelId, chunk.slice(0, h))).concat(await toRuntimeIds(modelId, chunk.slice(h)));
+      const a = await toRuntimeIds(modelId, chunk.slice(0, h), ctx);
+      return a.concat(await toRuntimeIds(modelId, chunk.slice(h), ctx));
     }
   }
 
@@ -141,9 +159,9 @@
    */
   async function loadModel(gen) {
     const stale = () => gen !== loadGen;
-    allObjects = null;
+    const ctx = { stale, all: null, failed: 0 };   // this load's own object cache and lookup failures
     setStatus(L2("Чета сглобките…", "Reading assemblies…"));
-    const raw = await readClass("IfcElementAssembly", /^Assembly/i);
+    const raw = await readClass("IfcElementAssembly", /^Assembly/i, ctx);
     if (stale()) return false;
     // the same assembly in two loaded models (overlapping exports, two versions): keep the first, warn (#11)
     const seenGuid = new Set();
@@ -170,7 +188,7 @@
     });
     if (stale()) return false;
     setStatus(L2("Чета болтовете…", "Reading bolts…"));
-    const rawBolts = await readClass("IfcMechanicalFastener", /^Bolt/i);
+    const rawBolts = await readClass("IfcMechanicalFastener", /^Bolt/i, ctx);
     if (stale()) return false;
     // a bolt group loaded twice (two overlapping models) is counted once (#11)
     const seenBolt = new Set();
@@ -198,8 +216,11 @@
         const notFound = [];
         for (let i = 0; i < todo.length; i += 500) {
           const chunk = todo.slice(i, i + 500);
-          const rts = await toRuntimeIds(mm, chunk);
+          const failedBefore = ctx.failed;
+          const rts = await toRuntimeIds(mm, chunk, ctx);
           if (stale()) return false;
+          // the whole chunk could not even be asked (model unloaded, viewer busy): give up on this model (M8)
+          if (ctx.failed - failedBefore >= chunk.length) { notFound.push(...todo.slice(i)); break; }
           const missing = [];
           chunk.forEach((g, k) => {
             const a = rts[k] != null ? asmOfChild.get(key(mm, rts[k])) : null;
@@ -247,7 +268,8 @@
     // everything at once, so the panel never shows half of one load and half of another
     state.asms = asms; state.byKey = byKey; state.byGuid = byGuid;
     state.bolts = bolts;
-    state.loadStats = { assemblies: asms.length, bolts: bolts.length, slowLookups: slow, dupAsms, dupBolts, childErrors };
+    state.loadStats = { assemblies: asms.length, bolts: bolts.length, slowLookups: slow, dupAsms, dupBolts, childErrors, lookupFailed: ctx.failed };
+    allObjects = ctx.all;
     state.hasLinks = exportHasLinks;
     return true;
   }
@@ -262,8 +284,13 @@
   }
 
   // ---------- library ----------
-  async function loadRecords() {
+  /** Statuses, holds and deliveries of the loaded assemblies. Read into locals; assigned only when this is still the
+   *  newest load, so a slow older load cannot overwrite the newer load's statuses (review round 3, M1). Without gen
+   *  (after a save) it always assigns. */
+  async function loadRecords(gen) {
+    const current = () => gen === undefined || gen === loadGen;
     const found = await state.client.findLibrary(state.project.id, R.LIB_NAMES);
+    if (!current()) return false;
     if (!found.lib) {
       state.lib = null;
       $("setupBox").hidden = false;
@@ -279,10 +306,13 @@
     }
     const links = state.asms.map((a) => "frn:entity:" + a.guid);
     const toMap = (m) => new Map([...m].map(([l, p]) => [l.replace(/^frn:entity:/, ""), p]));
-    state.status = toMap(await state.client.readMany(state.lib.id, R.DEF.status, links));
-    state.holds = toMap(await state.client.readMany(state.lib.id, R.DEF.hold, links));
+    const status = toMap(await state.client.readMany(state.lib.id, R.DEF.status, links));
+    const holds = toMap(await state.client.readMany(state.lib.id, R.DEF.hold, links));
     const dels = await state.client.listAll(state.lib.id, R.DEF.delivery, R.deliveryPrefix(state.project.id));
+    if (!current()) return false;
+    state.status = status; state.holds = holds;
     state.deliveries = [...dels].map(([link, p]) => Object.assign({ link }, p)).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    return true;
   }
 
   // ---------- figures ----------
@@ -607,7 +637,8 @@
   let loadGen = 0;
   async function load() {
     const gen = ++loadGen;
-    if (!(await loadModel(gen))) return;   // a newer load took over
+    try { if (!(await loadModel(gen))) return; }   // a newer load took over
+    catch (e) { if (gen !== loadGen) return; throw e; }   // an error of a superseded load (its model was unloaded) is not shown (L1)
     clearTimeout(waitTimer);
     if (!state.asms.length && !(allObjects || []).length && waitTries < 30) {
       // no objects yet: the panel opened before a model was loaded, or the model is still streaming in
@@ -625,8 +656,8 @@
       setStatus(L2("В заредените модели няма сглобки (IfcElementAssembly).", "No assemblies (IfcElementAssembly) in the loaded models.") +
         ` [${(allObjects || []).length} obj${seen ? ": " + seen : ""}]`, true); return;
     }
-    await loadRecords();
-    if (gen !== loadGen) return;
+    try { if (!(await loadRecords(gen)) && gen !== loadGen) return; }
+    catch (e) { if (gen !== loadGen) return; throw e; }   // an error of a superseded load is not shown (round 4, L8)
     state.ready = true;
     $("main").hidden = false;
     const site = state.bolts.filter((b) => b.sides && (b.sides.others || []).length).length;
@@ -635,6 +666,7 @@
     if (st.dupAsms || st.dupBolts) warn.push(L2(`заредени два пъти (припокриващи се модели): ${st.dupAsms} сглобки, ${st.dupBolts} болта – броени веднъж`,
       `loaded twice (overlapping models): ${st.dupAsms} assemblies, ${st.dupBolts} bolts – counted once`));
     if (st.childErrors) warn.push(L2(`${st.childErrors} сглобки без прочетени елементи`, `${st.childErrors} assemblies whose parts could not be read`));
+    if (st.lookupFailed) warn.push(L2(`${st.lookupFailed} основни елемента не можаха да се потърсят – презаредете`, `${st.lookupFailed} main parts could not be looked up – reload`));
     setStatus(`${state.asms.length} ${L2("сглобки", "assemblies")} · ${new Set(state.asms.map((a) => a.mark)).size} ${L2("марки", "marks")} · ${state.bolts.length} ${L2("болтови групи", "bolt groups")} (${site} ${L2("между две сглобки", "between two assemblies")})`
       + (st.slowLookups ? ` · ${L2("бавно търсене", "slow lookups")}: ${st.slowLookups}` : "")
       + (warn.length ? " · ⚠ " + warn.join("; ") : ""), !!warn.length);
@@ -656,9 +688,13 @@
   let selTimer = null, reloadTimer = null, waitTimer = null, waitTries = 0;
   function onEvent(event, data) {
     if (event === "extension.accessToken") onToken(data);
-    if (state.denied || !state.ready) return;
+    if (state.denied || !state.api) return;
+    // models loaded by a stage may still be streaming in while the first load runs: reload on their events too; the
+    // load generation makes the older load stand down (review round 3, M2)
+    // 3 s: a stage loads its models one after the other; one reload after the last of them (round 4, L9)
+    if (event === "viewer.onModelStateChanged") { clearTimeout(reloadTimer); reloadTimer = setTimeout(() => guarded(load), 3000); }
+    if (!state.ready) return;
     if (event === "viewer.onSelectionChanged" && state.follow) { clearTimeout(selTimer); selTimer = setTimeout(() => guarded(fromViewer), 200); }
-    if (event === "viewer.onModelStateChanged") { clearTimeout(reloadTimer); reloadTimer = setTimeout(() => guarded(load), 1500); }
   }
   if (window.parent === window) {
     if (/[?&]demo\b/.test(location.search)) { const s = document.createElement("script"); s.src = "demo.js?t=" + Date.now(); document.body.appendChild(s); }
