@@ -24,10 +24,22 @@
   const L2 = (b, e) => (lang === "bg" ? b : e);
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const num = (v) => { const n = parseFloat(String(v == null ? "" : v).replace(",", ".")); return isFinite(n) ? String(Math.round(n * 10) / 10) : String(v == null ? "" : v); };
+  const oldDate = (d) => { if (!d) return false; const t0 = new Date(); t0.setDate(t0.getDate() - 7); return String(d) < `${t0.getFullYear()}-${String(t0.getMonth() + 1).padStart(2, "0")}-${String(t0.getDate()).padStart(2, "0")}`; };   // > 7 days back (A6)
   const fmtDate = (d) => (d ? (lang === "bg" ? String(d).split("-").reverse().join(".") : d) : "");
   function setStatus(text, bad) { $("status").textContent = text; $("status").className = "status" + (bad ? " bad" : ""); }
+  // the result of a write is also shown at the bottom, next to the user's finger on a tablet (week 1, A2)
+  let toastTimer = 0;
+  function toast(text, bad) {
+    const el = $("toast");
+    if (!el) return;
+    el.setAttribute("role", bad ? "alert" : "status");
+    el.textContent = text; el.className = "show " + (bad ? "bad" : "ok");
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => { el.className = ""; }, bad ? 7000 : 4000);
+  }
+  const flash = (text, bad) => { setStatus(text, bad); toast(text, bad); };
+  const BUILD = ((document.currentScript && /[?&]v=(\d+)/.exec(document.currentScript.src)) || [])[1] || "dev";
   const errText = (e) => (e && (e.message || e.toString())) || String(e);
-  async function guarded(fn) { try { await fn(); } catch (e) { setStatus("Error: " + errText(e), true); console.error(e); } }
+  async function guarded(fn) { try { await fn(); } catch (e) { flash(L2("Грешка: ", "Error: ") + errText(e), true); console.error(e); } }
   async function pool(items, n, fn) {
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (next < items.length) { const k = next++; await fn(items[k], k); } }));
@@ -39,6 +51,7 @@
     bolts: [], status: new Map(), holds: new Map(), deliveries: [],
     fab: new Map(), fabPlan: null,   // fabrication dates per IFC GUID (fabrication.js); the import waiting for "Save"
     sel: [], coloured: false, tab: "marks", boltScope: "all", follow: true,
+    drafts: {}, flagArmed: null, dlvPending: null,   // typed date/note per card kept across selection changes (F6); big-write confirm (F1); delivery file waiting for "Запиши" (F7)
   };
   const key = (modelId, id) => modelId + ":" + id;
   // Pset link of a model object. FRN (Trimble's link notation) wants every segment URL-encoded, and Connect's own
@@ -302,7 +315,8 @@
     if (!found.lib) {
       state.lib = null;
       $("setupBox").hidden = false;
-      $("setupBox").innerHTML = L2(`Библиотеката <b>STEEL/Монтаж</b> още не съществува. Администратор я създава веднъж в Connect: Property Set Libraries → New library → име „STEEL/Монтаж“. Статусите не могат да се записват дотогава.`,
+      $("setupBox").innerHTML = found.denied ? L2(`Библиотеката <b>STEEL/Монтаж</b> не е видима за вас – може да съществува, но без достъп за вас. Попитайте администратора на проекта, преди някой да създаде нова.`,
+        `The library <b>STEEL/Монтаж</b> is not visible to you – it may exist without access for you. Ask the project admin before anyone creates a new one.`) : L2(`Библиотеката <b>STEEL/Монтаж</b> още не съществува. Администратор я създава веднъж в Connect: Property Set Libraries → New library → име „STEEL/Монтаж“. Статусите не могат да се записват дотогава.`,
         `The library <b>STEEL/Монтаж</b> does not exist yet. An admin creates it once in Connect: Property Set Libraries → New library → name "STEEL/Монтаж". Statuses cannot be saved until then.`);
       return;
     }
@@ -320,7 +334,8 @@
     // has history the encoded one lacks (an old cached client wrote it after the move, round 6 M2) - its fields win;
     // "stale" = the raw one is an old copy already contained in the encoded record - only deleted.
     const legacyOnly = [];
-    const isStale = (raw, enc) => { const rl = String(raw.log || ""); return JSON.stringify(raw) === JSON.stringify(enc) || (rl !== "" && String(enc.log || "").includes(rl)); };
+    const lastLine = (log) => String(log || "").split("\n").filter(Boolean).pop() || "";
+    const isStale = (raw, enc) => { const rl = lastLine(raw.log); return JSON.stringify(raw) === JSON.stringify(enc) || (rl !== "" && String(enc.log || "").includes(rl)); };
     const readBoth = async (def) => {
       const old = legacy.length ? toMap(await state.client.readMany(state.lib.id, def, legacy)) : new Map();
       const cur = toMap(await state.client.readMany(state.lib.id, def, links));
@@ -372,27 +387,57 @@
 
   // ---------- writing ----------
   const stateName = (id) => { const s = L.STATES.find((x) => x.id === id); return s ? (lang === "bg" ? s.bg : s.en) : id; };
+  // Who a "Отбележи" / "Отмени" press writes (week 1, F1): "on" writes only the selected pieces that are not marked
+  // yet, so dates, names and notes already recorded are never overwritten. Only when every selected piece is marked
+  // does "on" correct them all (the button then says "Поправи"). "off" writes only the marked ones.
+  function flagTargets(kind, on) {
+    const store = kind === "hold" ? state.holds : state.status;
+    const marked = (a) => !!(store.get(a.guid) || {})[kind];
+    if (!on) return { list: state.sel.filter(marked), correcting: false };
+    const notYet = state.sel.filter((a) => !marked(a));
+    return notYet.length ? { list: notYet, correcting: false } : { list: state.sel.slice(), correcting: state.sel.length > 0 };
+  }
+  const BIG = 10;   // more than this many pieces in one press needs a second tap within 10 s
+  const flagArmed = (kind, on, n) => !!state.flagArmed && state.flagArmed.key === `${kind}:${on ? 1 : 0}:${n}` && Date.now() - state.flagArmed.at < 10000;
   async function applyFlag(kind, on) {
-    if (!state.lib) return setStatus(L2("Няма библиотека STEEL/Монтаж.", "No library STEEL/Монтаж."), true);
-    if (!can(kind === "hold" ? "hold" : "status")) return setStatus(t("noRight"), true);
-    const targets = state.sel.slice();
+    if (!state.lib) return flash(L2("Няма библиотека STEEL/Монтаж.", "No library STEEL/Монтаж."), true);
+    if (!can(kind === "hold" ? "hold" : "status")) return flash(t("noRight"), true);
+    const { list: targets, correcting } = flagTargets(kind, on);
     if (!targets.length) return;
-    const date = ($("d_" + kind) || {}).value || R.today();
+    if (targets.length > BIG && !flagArmed(kind, on, targets.length)) {
+      state.flagArmed = { key: `${kind}:${on ? 1 : 0}:${targets.length}`, at: Date.now() }; render(); setTimeout(render, 10500); return;
+    }
+    state.flagArmed = null;
+    const typedDate = ($("d_" + kind) || {}).value || "";
+    const date = typedDate || R.today();
     const note = (($("n_" + kind) || {}).value || "").trim();
-    if (on && kind !== "erected" && !note) return setStatus(L2("Въведете бележка / причина.", "Enter a note / reason."), true);
+    const noteKey = kind === "hold" ? "hold_reason" : `${kind}_note`;
+    // a correction with an empty box keeps each piece's own value (round 8 M1); a new mark needs the note as before
+    if (on && kind !== "erected" && !note && !correcting) return flash(L2("Въведете бележка / причина.", "Enter a note / reason."), true);
+    if (on && date > R.today()) return flash(L2("Датата е в бъдещето.", "The date is in the future."), true);
     const def = kind === "hold" ? R.DEF.hold : R.DEF.status, store = kind === "hold" ? state.holds : state.status;
     let done = 0, failed = 0, first = "";
     await pool(targets, 6, async (a) => {
       const cur = store.get(a.guid) || null;
       if (!on && !(cur && cur[kind])) return;
-      const next = R.setFlag(cur, kind, on, { date, note, by: state.user, mark: a.mark });
+      let info = { date, note, by: state.user, mark: a.mark };
+      if (correcting && cur) {
+        const ownDate = cur[`${kind}_date`] || date;
+        const newDate = typedDate && typedDate !== ownDate ? typedDate : ownDate;
+        info = { date: newDate, note: note || cur[noteKey] || "", by: newDate !== ownDate ? state.user : cur[`${kind}_by`] || state.user, mark: a.mark };
+      }
+      const next = R.setFlag(cur, kind, on, info);
       try {
         await (on ? state.client.write : state.client.replace).call(state.client, state.lib.id, def, entLink(a.guid), next);
         store.set(a.guid, next); done++;
         await dropLegacy(def, a.guid);
       } catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
     });
-    setStatus(`${t(kind)}: ${on ? L2("записано", "saved") : L2("отменено", "undone")} ${done}` + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : ""), failed > 0);
+    if (done && !failed) delete state.drafts[kind];
+    const skipped = on ? state.sel.length - targets.length : 0;
+    flash(`${t(kind)}: ${on ? L2("записано", "saved") : L2("отменено", "undone")} ${done}`
+      + (skipped ? ` · ${skipped} ${L2("вече отбелязани – не са променени", "already marked – left as they were")}` : "")
+      + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : ""), failed > 0);
     render();
     if (state.coloured) await applyColours();
   }
@@ -408,8 +453,8 @@
     state.deliveries.unshift(Object.assign({ link }, rec));
     const known = new Set(state.asms.map((a) => L.normMark(a.mark)));
     const unknown = lines.filter((l) => !known.has(l.mark)).map((l) => l.mark);
-    setStatus(L2(`Доставката е записана (${lines.length} марки)`, `Delivery saved (${lines.length} marks)`) + (unknown.length ? ` · ${L2("няма в модела", "not in the model")}: ${unknown.join(", ")}` : ""), unknown.length > 0);
-    $("dlvText").value = ""; $("dlvNo").value = "";
+    flash(L2(`Доставката е записана (${lines.length} марки)`, `Delivery saved (${lines.length} marks)`) + (unknown.length ? ` · ${L2("няма в модела", "not in the model")}: ${unknown.join(", ")}` : ""), unknown.length > 0);
+    $("dlvText").value = ""; $("dlvNo").value = ""; state.dlvDraft = null;
     render();
     if (state.coloured) await applyColours();
   }
@@ -455,7 +500,9 @@
     }
     const r = R.linesFromRows(rows);
     if (r.skipped.length) setStatus(L2("Пропуснати редове: ", "Skipped rows: ") + r.skipped.slice(0, 5).join(" | "), true);
-    if (r.lines.length && window.confirm(L2(`Да се запише доставка с ${r.lines.length} марки (${r.lines.reduce((t, l) => t + l.qty, 0)} бр.)?`, `Save a delivery of ${r.lines.length} marks (${r.lines.reduce((t, l) => t + l.qty, 0)} pcs)?`))) await addDelivery(r.lines, file.name);
+    // inline "Запиши / Откажи" box in the Доставки tab (window.confirm can be blocked inside Connect, week 1 F7)
+    if (r.lines.length) { state.dlvPending = { lines: r.lines, source: file.name }; state.tab = "deliveries"; render(); }
+    else if (!r.skipped.length) flash(L2("Във файла няма редове с марка и количество.", "No lines with mark and quantity in the file."), true);
   }
 
   // ---------- fabrication import (fabricator's Excel -> AM_Fabrication) ----------
@@ -557,11 +604,8 @@
             patch = {};
             for (const [k, v] of Object.entries(rp)) if (k !== "log" && JSON.stringify(v) !== JSON.stringify(ep[k])) patch[k] = v;
             const extra = String(rp.log || "").split("\n").filter((l) => l && !String(ep.log || "").includes(l));
-            if (extra.length) patch.log = [ep.log, ...extra].filter(Boolean).join("\n").slice(-1500);
-          } else {
-            patch = {};
-            for (const [k, v] of Object.entries(rp)) if (!(k in ep)) patch[k] = v;
-          }
+            if (extra.length) patch.log = [ep.log, ...extra].filter(Boolean).join("\n").slice(r.def === F.DEF_ID ? -1500 : -4000);
+          } else patch = null;   // stale: the encoded record already has its history; fields it lacks were cleared on purpose (round 7 M1)
           if (patch && Object.keys(patch).length) await state.client.writeIfUnchanged(state.lib.id, r.def, entLink(r.guid), patch, enc ? enc.v : undefined);
           await state.client.remove(state.lib.id, r.def, legacyLink(r.guid));
         }
@@ -569,7 +613,7 @@
       } catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
     });
     await loadRecords();
-    setStatus(L2(`Преместени ${done} записа.`, `Moved ${done} records.`) + (skipped ? ` · ${skipped} ${L2("без права", "no right")}` : "")
+    flash(L2(`Преместени ${done} записа.`, `Moved ${done} records.`) + (skipped ? ` · ${skipped} ${L2("без права", "no right")}` : "")
       + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
       + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failed > 0);
     render();
@@ -608,7 +652,7 @@
       catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
     });
     await loadRecords();
-    setStatus(L2(`Изтрити дати: ${done} сглобки.`, `Dates cleared: ${done} assemblies.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
+    flash(L2(`Изтрити дати: ${done} сглобки.`, `Dates cleared: ${done} assemblies.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
       + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failed > 0);
     render();
   }
@@ -631,6 +675,11 @@
           let fresh = (cur && cur.props) || null, moved = false;
           // first write to the encoded link of a "$" GUID: the old raw-"$" record is the base and all its fields move over
           if (!fresh && hasLegacy(c.ifc)) { const old = await state.client.readOne(state.lib.id, F.DEF_ID, legacyLink(c.ifc)); fresh = old && old.props; moved = !!fresh; }
+          else if (fresh && (state.legacyOnly || []).some((r) => r.def === F.DEF_ID && r.guid === c.ifc && r.kind === "merge")) {
+            // raw record newer than the encoded one: merged exactly as readBoth showed it in the preview (round 7 M2)
+            const old = await state.client.readOne(state.lib.id, F.DEF_ID, legacyLink(c.ifc));
+            if (old && old.props) { fresh = Object.assign({}, fresh, old.props, { log: [fresh.log, old.props.log].filter(Boolean).join("\n") }); moved = true; }
+          }
           fresh = fresh || {};
           if (F.changedSince(c, c.before, fresh).length) { meanwhile.push(c.mark || c.ifc); state.fab.set(c.ifc, fresh); return; }
           const patch = Object.assign(moved ? Object.assign({}, fresh) : {}, F.patchFor(fresh, c, { source: fp.source, by: state.user }));
@@ -650,7 +699,7 @@
       fp.p.overwrites = failedList.reduce((n, c) => n + c.over.length, 0);
       fp.p.fills = failedList.reduce((n, c) => n + Object.keys(c.set).length, 0) - fp.p.overwrites;
     } else state.fabPlan = null;
-    setStatus(L2(`Записани ${done} сглобки.`, `Saved ${done} assemblies.`)
+    flash(L2(`Записани ${done} сглобки.`, `Saved ${done} assemblies.`)
       + (meanwhile.length ? L2(` · ${meanwhile.length} променени междувременно от друг – не са записани, импортирайте файла пак: `, ` · ${meanwhile.length} changed by someone else meanwhile – not saved, import the file again: `) + meanwhile.slice(0, 10).join(", ") + "." : "")
       + (failedList.length ? ` · ${failedList.length} ${L2("грешки", "failed")} (${first})` : "")
       + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failedList.length + meanwhile.length > 0);
@@ -684,16 +733,33 @@
     }
     // actions
     const has = (store, kind) => sel.filter((a) => (store.get(a.guid) || {})[kind]).length;
-    const act = (kind, colour, store, right, needNote, noteLbl) => `<div class="act" style="--c:${colour}">
+    const act = (kind, colour, store, right, needNote, noteLbl) => {
+      const on = flagTargets(kind, true), off = flagTargets(kind, false);
+      // prefill with the recorded values when every selected piece is marked and they agree; a typed draft wins
+      const noteKey = kind === "hold" ? "hold_reason" : `${kind}_note`;
+      const recs = on.correcting ? sel.map((a) => store.get(a.guid) || {}) : [];
+      const same = (k) => (recs.length && recs.every((r) => (r[k] || "") === (recs[0][k] || "")) ? recs[0][k] || "" : "");
+      const dr = state.drafts[kind] || {};
+      const dateVal = dr.date != null ? dr.date : on.correcting ? same(`${kind}_date`) : R.today();
+      const noteVal = dr.note != null ? dr.note : same(noteKey);
+      const mixed = on.correcting && (!same(`${kind}_date`) || !same(noteKey));
+      const onLbl = flagArmed(kind, true, on.list.length) ? L2(`Потвърди: ${on.list.length} сглобки`, `Confirm: ${on.list.length} assemblies`)
+        : on.correcting ? L2(`Поправи (${on.list.length})`, `Correct (${on.list.length})`) : `${t("set")}${sel.length ? ` (${on.list.length})` : ""}`;
+      const offLbl = flagArmed(kind, false, off.list.length) ? L2(`Потвърди: отмени ${off.list.length}`, `Confirm: undo ${off.list.length}`) : `${t("undo")}${off.list.length ? ` (${off.list.length})` : ""}`;
+      return `<div class="act" style="--c:${colour}">
       <div class="hd"><span class="nm">${esc(t(kind))}</span><span class="st">${sel.length ? `${has(store, kind)}/${sel.length}` : ""}</span></div>
-      <div class="row">${kind === "erected" || kind === "hold" ? `<input type="date" id="d_${kind}" value="${R.today()}">` : ""}<input type="text" id="n_${kind}" placeholder="${esc(noteLbl)}${needNote ? " *" : ""}"></div>
-      <div class="row"><button class="small" data-act="on" data-kind="${kind}" ${sel.length && right ? "" : "disabled"}>${esc(t("set"))}</button>
-        <button class="small secondary" data-act="off" data-kind="${kind}" ${has(store, kind) && right ? "" : "disabled"}>${esc(t("undo"))}</button>
+      <div class="row">${kind === "erected" || kind === "hold" ? `<input type="date" id="d_${kind}" max="${R.today()}" value="${esc(dateVal)}"><span class="sub" id="h_${kind}" ${dr.date != null && oldDate(dr.date) ? "" : "hidden"}>${esc(L2("проверете датата", "check the date"))}</span>` : ""}<input type="text" id="n_${kind}" value="${esc(noteVal)}" placeholder="${esc(mixed ? L2("различни – празно = без промяна", "differ – empty = unchanged") : noteLbl + (needNote ? " *" : ""))}"></div>
+      ${on.correcting && sel.length ? `<div class="sub">${esc(L2("Всички избрани вече са отбелязани. „Поправи“ записва само това, което промените; празно поле = всяка сглобка запазва своето.", "All selected are already marked. \"Correct\" writes only what you change; an empty box = each keeps its own."))}</div>`
+        : sel.length && on.list.length < sel.length ? `<div class="sub">${esc(L2(`${sel.length - on.list.length} вече отбелязани остават както са.`, `${sel.length - on.list.length} already marked stay as they are.`))}</div>` : ""}
+      <div class="row"><button class="small" data-act="on" data-kind="${kind}" ${on.list.length && right ? "" : "disabled"}>${esc(onLbl)}</button>
+        <button class="small secondary undo" data-act="off" data-kind="${kind}" ${off.list.length && right ? "" : "disabled"}>${esc(offLbl)}</button>
         ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div></div>`;
+    };
     $("acts").innerHTML = act("erected", "#2E7D32", state.status, can("status"), false, t("note"))
       + act("wrong", "#C62828", state.status, can("status"), true, t("note"))
       + act("hold", "#7B1FA2", state.holds, can("hold"), true, t("reason"));
     renderMarks(av); renderDeliveries(); renderFab(); renderBolts(); renderDocs(av);
+    const bl = $("build"); if (bl) bl.textContent = `Стомана v${BUILD}`;
   }
 
   function renderFab() {
@@ -753,9 +819,14 @@
 
   function renderDeliveries() {
     const right = can("status");
-    $("tab-deliveries").innerHTML = `<div class="box">
-        <div class="bar"><input type="date" id="dlvDate" value="${R.today()}"><input type="text" id="dlvNo" placeholder="${esc(L2("Стокова разписка №", "Delivery note no."))}"></div>
-        <textarea id="dlvText" placeholder="${esc(L2("Марка и брой на ред, напр.\nRF22 3\nCL22 2", "Mark and qty per line, e.g.\nRF22 3\nCL22 2"))}"></textarea>
+    const pend = state.dlvPending, dd = state.dlvDraft || {};
+    const pendBox = pend ? `<div class="warn"><b>${esc(pend.source)}</b>: ${esc(L2(`${pend.lines.length} марки, ${pend.lines.reduce((n, l) => n + l.qty, 0)} бр.`, `${pend.lines.length} marks, ${pend.lines.reduce((n, l) => n + l.qty, 0)} pcs`))}
+        <div class="sub">${esc(pend.lines.slice(0, 20).map((l) => `${l.mark}×${l.qty}`).join(", "))}${pend.lines.length > 20 ? " …" : ""}</div>
+        <div class="sub">${esc(L2("Дата и № на стоковата разписка се вземат от полетата по-долу.", "Date and delivery note no. come from the fields below."))}</div>
+        <div class="bar"><button class="small" data-act="dlvPendOk" ${right ? "" : "disabled"}>${esc(L2("Запиши доставката", "Save the delivery"))}</button><button class="small secondary" data-act="dlvPendNo">${esc(L2("Откажи", "Cancel"))}</button></div></div>` : "";
+    $("tab-deliveries").innerHTML = pendBox + `<div class="box">
+        <div class="bar"><input type="date" id="dlvDate" max="${R.today()}" value="${esc(dd.dlvDate != null ? dd.dlvDate : R.today())}"><input type="text" id="dlvNo" value="${esc(dd.dlvNo || "")}" placeholder="${esc(L2("Стокова разписка №", "Delivery note no."))}"></div>
+        <textarea id="dlvText" placeholder="${esc(L2("Марка и брой на ред, напр.\nRF22 3\nCL22 2", "Mark and qty per line, e.g.\nRF22 3\nCL22 2"))}">${esc(dd.dlvText || "")}</textarea>
         <div class="bar"><button class="small" data-act="dlvAdd" ${right ? "" : "disabled"}>${L2("Запиши доставка", "Save delivery")}</button>
           <label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel/CSV", "Import Excel/CSV")}<input type="file" id="dlvFile" accept=".xlsx,.csv,.txt" hidden></label>
           ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div>
@@ -882,12 +953,12 @@
       const p = await parentAssembly(m.modelId, id);   // a part was clicked: take its assembly
       if (p) picked.set(p.guid, p);
     }
-    state.sel = [...picked.values()]; state.fabClearArmed = 0;
+    state.sel = [...picked.values()]; selChanged();
     render();
   }
   async function selectMark(mark) {
     const list = state.asms.filter((a) => L.normMark(a.mark) === L.normMark(mark));
-    state.sel = list; state.fabClearArmed = 0;
+    state.sel = list; selChanged();
     const s = sel(list);
     await state.api.viewer.setSelection(s, "set");
     try { await state.api.viewer.setCamera(s, { animationTime: 400 }); } catch {}
@@ -906,6 +977,8 @@
       else if (act === "dlvAdd") await addDelivery(R.parseDeliveryText($("dlvText").value).lines, "typed");
       else if (act === "dlvCancel") await cancelDelivery(+b.dataset.i);
       else if (act === "dlvCancelNo") { state.cancelling = null; render(); }
+      else if (act === "dlvPendOk") { const p = state.dlvPending; state.dlvPending = null; if (p) await addDelivery(p.lines, p.source); }
+      else if (act === "dlvPendNo") { state.dlvPending = null; setStatus(L2("Импортът е отказан.", "Import cancelled.")); render(); }
       else if (act === "fabApply") await applyFab();
       else if (act === "moveLegacy") await moveLegacy();
       else if (act === "clearFab") await clearFab();
@@ -917,7 +990,23 @@
       else if (act === "docDeliveries") await exportDeliveries();
     });
   });
-  $("btnSelClear").onclick = () => { state.sel = []; state.fabClearArmed = 0; render(); };
+  $("btnSelClear").onclick = () => { state.sel = []; state.fabClearArmed = 0; state.flagArmed = null; state.drafts = {}; state.draftSel = null; render(); };
+  // typed dates and notes survive re-renders until saved or the selection is cleared (week 1, F6). They belong to the
+  // selection they were typed for: adding pieces keeps them, any other selection drops them (round 8 M2).
+  function selChanged() {
+    state.fabClearArmed = 0; state.flagArmed = null;   // a confirm never carries over to another selection (round 8 low 3)
+    if (state.draftSel && !state.draftSel.every((g) => state.sel.some((a) => a.guid === g))) { state.drafts = {}; state.draftSel = null; }
+  }
+  document.addEventListener("input", (e) => {
+    const id = e.target.id || "";
+    if (/^dlv(Date|No|Text)$/.test(id)) { state.dlvDraft = Object.assign(state.dlvDraft || {}, { [id]: e.target.value }); return; }   // round 8 M5
+    const m = /^([dn])_(erected|wrong|hold)$/.exec(id);
+    if (!m) return;
+    const dr = state.drafts[m[2]] || (state.drafts[m[2]] = {});
+    dr[m[1] === "d" ? "date" : "note"] = e.target.value;
+    state.draftSel = state.sel.map((a) => a.guid);
+    if (m[1] === "d") { const h = $("h_" + m[2]); if (h) h.hidden = !oldDate(e.target.value); }
+  });
   $("chkFollow").onchange = (e) => { state.follow = e.target.checked; };
   $("chkColour").onchange = (e) => guarded(async () => { state.coloured = e.target.checked; await applyColours(); });
   $("selLang").value = lang;
@@ -986,7 +1075,7 @@
     if (event === "viewer.onSelectionChanged" && state.follow) { clearTimeout(selTimer); selTimer = setTimeout(() => guarded(fromViewer), 200); }
   }
   if (window.parent === window) {
-    if (/[?&]demo\b/.test(location.search)) { const s = document.createElement("script"); s.src = "demo.js?t=" + Date.now(); document.body.appendChild(s); }
+    if (/[?&]demo\b/.test(location.search) && /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) { const s = document.createElement("script"); s.src = "demo.js?t=" + Date.now(); document.body.appendChild(s); }
     else setStatus("Not inside Trimble Connect. Add this extension to a project and open it from the 3D viewer side panel.", true);
     return;
   }

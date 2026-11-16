@@ -45,6 +45,20 @@
   .tabs button { background:transparent; color:var(--ink); border-color:var(--line); }
   .tabs button.on { background:var(--ink); color:#fff; border-color:var(--ink); }
   .scroll { max-height:340px; overflow:auto; }
+  #toast:not(.show) { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
+  body { padding-bottom:56px; }   /* room for the result message, so it never covers the last buttons */
+  #toast.show { position:fixed; left:max(12px, env(safe-area-inset-left, 0px)); right:max(12px, env(safe-area-inset-right, 0px)); bottom:calc(12px + env(safe-area-inset-bottom, 0px)); z-index:20;
+    padding:9px 12px; font-size:13px; color:#fff; background:#2E7D32; box-shadow:0 2px 8px rgba(0,0,0,.2); }
+  #toast.show.bad { background:var(--bad); }
+  .act .row button.undo { margin-left:auto; }
+  #build { margin-top:18px; font-size:10.5px; color:var(--muted); text-align:right; }
+  /* touch screens: bigger targets, 16px inputs so iOS does not zoom (week 1, A1) */
+  @media (pointer: coarse) {
+    button, button.small, .tabs button { min-height:40px; padding:8px 12px; font-size:14px; }
+    select, input[type=date], input[type=text], textarea { min-height:40px; font-size:16px; }
+    label.chk { min-height:36px; font-size:14px; }
+    .act .row { gap:8px; }
+  }
   .cnt { display:inline-block; min-width:18px; padding:0 4px; font-size:11px; background:#ece8df; text-align:center; }
 </style>
 </head>
@@ -76,13 +90,15 @@
   <div id="tab-bolts" hidden></div>
   <div id="tab-docs" hidden></div>
 </div>
+<div id="build"></div>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/trimble-connect-workspace-api@0.3.38/dist/iife/trimbleconnect.workspace.api.js" integrity="sha384-lFiNt/56q6HnUNbuy0WHO3NP6BkQjY4EH8+5eELYVfnhkB42snRTmSa3UOAlX9gg" crossorigin="anonymous"></script>
-<script src="arsten-access.js?v=8"></script>
-<script src="psetapi.js?v=7"></script>
+<script src="arsten-access.js?v=9"></script>
+<script src="psetapi.js?v=8"></script>
 <script src="steel.js?v=1"></script>
 <script src="records.js?v=2"></script>
 <script src="fabrication.js?v=2"></script>
-<script src="app.js?v=19"></script>
+<script src="app.js?v=22"></script>
 </body>
 </html>
