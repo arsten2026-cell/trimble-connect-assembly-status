@@ -52,6 +52,7 @@
     fab: new Map(), fabPlan: null,   // fabrication dates per IFC GUID (fabrication.js); the import waiting for "Save"
     sel: [], coloured: false, tab: "marks", boltScope: "all", follow: true,
     drafts: {}, flagArmed: null, dlvPending: null,   // typed date/note per card kept across selection changes (F6); big-write confirm (F1); delivery file waiting for "Запиши" (F7)
+    noBackupAsk: null, noBackupOk: null,   // failed undo file before fab-clear / Премести: the inline question, and the action confirmed without one (review 9 M5)
   };
   const key = (modelId, id) => modelId + ":" + id;
   // Pset link of a model object. FRN (Trimble's link notation) wants every segment URL-encoded, and Connect's own
@@ -60,6 +61,11 @@
   const entLink = (guid) => "frn:entity:" + encodeURIComponent(guid);
   const legacyLink = (guid) => "frn:entity:" + guid;
   const hasLegacy = (guid) => entLink(guid) !== legacyLink(guid);
+  /** GUID of a pset link, whichever form it is in (raw "$" or "%24"). */
+  const guidOfLink = (l) => { const g = String(l).replace(/^frn:entity:/, ""); try { return decodeURIComponent(g); } catch { return g; } };
+  // a raw-"$" copy already contained in the encoded record (same record, or its last history line is there): only deleted
+  const lastLine = (log) => String(log || "").split("\n").filter(Boolean).pop() || "";
+  const isStale = (raw, enc) => { const rl = lastLine(raw.log); return JSON.stringify(raw) === JSON.stringify(enc) || (rl !== "" && String(enc.log || "").includes(rl)); };
   const can = (what) => {
     const r = state.access && state.access.role;
     if (window.ARSTEN_DEMO) return true;
@@ -328,14 +334,12 @@
     }
     const links = state.asms.map((a) => entLink(a.guid));
     const legacy = state.asms.filter((a) => hasLegacy(a.guid)).map((a) => legacyLink(a.guid));
-    const toMap = (m) => new Map([...m].map(([l, p]) => { const g = l.replace(/^frn:entity:/, ""); try { return [decodeURIComponent(g), p]; } catch { return [g, p]; } }));
+    const toMap = (m) => new Map([...m].map(([l, p]) => [guidOfLink(l), p]));
     // Records still under a raw-"$" link (Connect's own panel and Tekla never show them) are listed in
     // state.legacyOnly for "Премести": kind "move" = only the raw record exists; "merge" = both exist and the raw one
     // has history the encoded one lacks (an old cached client wrote it after the move, round 6 M2) - its fields win;
     // "stale" = the raw one is an old copy already contained in the encoded record - only deleted.
     const legacyOnly = [];
-    const lastLine = (log) => String(log || "").split("\n").filter(Boolean).pop() || "";
-    const isStale = (raw, enc) => { const rl = lastLine(raw.log); return JSON.stringify(raw) === JSON.stringify(enc) || (rl !== "" && String(enc.log || "").includes(rl)); };
     const readBoth = async (def) => {
       const old = legacy.length ? toMap(await state.client.readMany(state.lib.id, def, legacy)) : new Map();
       const cur = toMap(await state.client.readMany(state.lib.id, def, links));
@@ -366,7 +370,14 @@
   }
 
   // ---------- figures ----------
-  const avail = () => L.availability(state.asms, state.status, state.holds, state.deliveries);
+  // delivered per mark = max(typed deliveries, instances with an Excel DelivDate); an instance with a DelivDate counts
+  // as delivered for its colour; an undated one only for typed deliveries beyond the dated / erected pieces (owner's rule
+  // 16.11.2026, review 9 H3 / M6, records.js availabilityWithFab)
+  const avail = () => R.availabilityWithFab(L, state.asms, state.status, state.holds, state.deliveries, state.fab);
+  /** Where a mark's delivered figure comes from: "въведени" / "Excel" / both. */
+  const srcName = (src) => ({ typed: L2("въведени", "typed"), excel: "Excel", both: L2("въведени + Excel", "typed + Excel") }[src] || "");
+  const srcFigures = (m) => `Excel: ${m.excel}, ${L2("въведени", "typed")}: ${m.typed}`;
+  const differsWarn = (av) => (av.differs.length ? `<div class="warn">${esc(L2("Доставени: Excel от производителя и въведените доставки се различават (брои се по-голямото): ", "Delivered: the fabricator's Excel and the typed deliveries differ (the larger counts): "))}${esc(av.differs.map((m) => `${m.mark} (${srcFigures(m)})`).join(", "))}</div>` : "");
   const erectedFn = () => (g) => !!(state.status.get(g) || {}).erected;
 
   // ---------- colours ----------
@@ -385,8 +396,63 @@
     }
   }
 
+  // ---------- undo files before mass actions (shared/arsten-backup.js, owner 16.11.2026) ----------
+  const backupCache = new Map();
+  let backupCore = null;
+  const coreFor = () => window.ARSTEN_PHOTOS_CORE || backupCore || (backupCore = ArstenBackup.coreClient(ArstenAccess.coreBase(state.project.location), getToken));
+  /** Snapshot of the records [{def, link}] an action is about to change or delete, read fresh (or taken from `known`,
+   *  Map def -> Map link -> props), uploaded to _ArstenDocs/Backups/<day>/ before the action runs. Upload failed: the
+   *  JSON is downloaded in the browser and the action goes on. A failed READ stops the action: nothing changes without
+   *  its undo file. Returns the text added to the result message.
+   *  Review 9: no window.ArstenBackup -> the action stops (low 14); a batch-get that echoed a requested link in the
+   *  other "$" form stops it too (M4); nothing saved at all gets its own wording (M5). `destructive` (fab-clear,
+   *  Премести): without a successful upload the action stops once and asks "Продължи без архив" inline; returns null
+   *  then and the caller must not go on. */
+  const NO_BACKUP = () => L2("Архивът не може да се направи – нищо не е променено: ", "The backup could not be made – nothing was changed: ");
+  async function backupFirst(action, items, known, destructive) {
+    if (!items.length) return "";
+    if (!window.ArstenBackup) throw new Error(NO_BACKUP() + L2("модулът за архив (arsten-backup.js) не е зареден. Презаредете панела.", "the backup module (arsten-backup.js) is not loaded. Reload the panel."));
+    const maps = new Map(known || []);
+    try {
+      for (const def of new Set(items.map((x) => x.def))) {
+        if (maps.has(def)) continue;
+        const asked = [...new Set(items.filter((x) => x.def === def).map((x) => x.link))];
+        const got = await state.client.readMany(state.lib.id, def, asked);
+        const odd = R.echoMismatch(asked, got, guidOfLink);
+        if (odd.length) { console.warn("batch-get returned another link form for", odd, [...got.keys()]); throw new Error(L2(`услугата върна друга форма на връзката за ${odd.length} записа`, `the service returned another link form for ${odd.length} records`)); }
+        maps.set(def, got);
+      }
+    } catch (e) { throw new Error(NO_BACKUP() + errText(e)); }
+    const snap = ArstenBackup.snapshot({ tool: "steel", action, project: state.project, by: state.user, library: state.lib, records: ArstenBackup.recordsFrom(items, maps) });
+    const res = await ArstenBackup.save({ core: coreFor(), projectId: state.project.id, snapshot: snap, cache: backupCache });
+    const allowed = state.noBackupOk === action;
+    state.noBackupOk = null;
+    if (res.uploaded) return ArstenBackup.note(res, lang);
+    console.warn("backup not uploaded to Connect", res.error);
+    const text = res.downloaded ? ArstenBackup.failedText(lang)
+      : L2("Архивът НЕ е запазен – нито е качен в Connect, нито е изтеглен", "The backup was NOT saved – neither uploaded to Connect nor downloaded");
+    if (destructive && !allowed) {
+      state.noBackupAsk = { action, text };
+      flash(text + L2(". Действието е спряно – нищо не е променено.", ". The action was stopped – nothing was changed."), true);
+      render();
+      return null;
+    }
+    toast(text, true);
+    return " · " + text;
+  }
+  /** Inline second confirmation after a failed backup of a destructive action (review 9 M5). */
+  function noBackupBox() {
+    const q = state.noBackupAsk;
+    if (!q) return "";
+    return `<div class="warn"><b>${esc(q.text)}.</b> ${esc(L2("Действието е спряно. Опитайте пак по-късно или продължете без архив (без възможност за връщане).", "The action was stopped. Try again later or go on without a backup (no way back)."))}
+      <div class="bar"><button class="small" data-act="noBackupGo">${esc(L2("Продължи без архив", "Continue without backup"))}</button><button class="small secondary" data-act="noBackupNo">${esc(L2("Откажи", "Cancel"))}</button></div></div>`;
+  }
+  /** The links a write to these GUIDs touches: the encoded one, plus the raw-"$" copy dropLegacy deletes. */
+  const linksOf = (def, guids) => guids.flatMap((g) => [{ def, link: entLink(g) }]
+    .concat((state.legacyOnly || []).some((r) => r.def === def && r.guid === g) ? [{ def, link: legacyLink(g) }] : []));
+
   // ---------- writing ----------
-  const stateName = (id) => { const s = L.STATES.find((x) => x.id === id); return s ? (lang === "bg" ? s.bg : s.en) : id; };
+  const stateName =(id) => { const s = L.STATES.find((x) => x.id === id); return s ? (lang === "bg" ? s.bg : s.en) : id; };
   // Who a "Отбележи" / "Отмени" press writes (week 1, F1): "on" writes only the selected pieces that are not marked
   // yet, so dates, names and notes already recorded are never overwritten. Only when every selected piece is marked
   // does "on" correct them all (the button then says "Поправи"). "off" writes only the marked ones.
@@ -416,6 +482,8 @@
     if (on && kind !== "erected" && !note && !correcting) return flash(L2("Въведете бележка / причина.", "Enter a note / reason."), true);
     if (on && date > R.today()) return flash(L2("Датата е в бъдещето.", "The date is in the future."), true);
     const def = kind === "hold" ? R.DEF.hold : R.DEF.status, store = kind === "hold" ? state.holds : state.status;
+    // more than BIG pieces (the confirmed path): undo file first
+    const bak = targets.length > BIG ? await backupFirst(`${kind}-${on ? (correcting ? "correct" : "set") : "undo"}`, linksOf(def, targets.map((a) => a.guid))) : "";
     let done = 0, failed = 0, first = "";
     await pool(targets, 6, async (a) => {
       const cur = store.get(a.guid) || null;
@@ -428,16 +496,23 @@
       }
       const next = R.setFlag(cur, kind, on, info);
       try {
-        await (on ? state.client.write : state.client.replace).call(state.client, state.lib.id, def, entLink(a.guid), next);
-        store.set(a.guid, next); done++;
-        await dropLegacy(def, a.guid);
+        if (!on && hasRaw(def, a.guid)) {
+          // undo over a raw-"$" copy (review 9 M1): full record to the encoded link, raw copy deleted, then the replace
+          await R.replaceOverRaw(state.client, state.lib.id, def, entLink(a.guid), legacyLink(a.guid), next);
+          state.legacyOnly = state.legacyOnly.filter((r) => !(r.def === def && r.guid === a.guid));
+          store.set(a.guid, next); done++;
+        } else {
+          await (on ? state.client.write : state.client.replace).call(state.client, state.lib.id, def, entLink(a.guid), next);
+          store.set(a.guid, next); done++;
+          await dropLegacy(def, a.guid);
+        }
       } catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
     });
     if (done && !failed) delete state.drafts[kind];
     const skipped = on ? state.sel.length - targets.length : 0;
     flash(`${t(kind)}: ${on ? L2("записано", "saved") : L2("отменено", "undone")} ${done}`
       + (skipped ? ` · ${skipped} ${L2("вече отбелязани – не са променени", "already marked – left as they were")}` : "")
-      + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : ""), failed > 0);
+      + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "") + bak, failed > 0);
     render();
     if (state.coloured) await applyColours();
   }
@@ -576,11 +651,13 @@
       + (skipped.length ? L2(` Пропуснати листове (без GUID / дати): `, ` Sheets skipped (no GUID / dates): `) + skipped.join(", ") : ""), skipped.length > 0);   // round 5, L5
     render();
   }
+  /** A raw-"$" copy of this record was found at load time (any kind: move / merge / stale). */
+  function hasRaw(def, guid) { return hasLegacy(guid) && (state.legacyOnly || []).some((r) => r.def === def && r.guid === guid); }
   const rightFor = (def) => can(def === R.DEF.hold ? "hold" : def === R.DEF.status ? "status" : "fab");
   /** After a record is safely under its encoded link, delete the raw-"$" copy, so it can never come back when the
    *  encoded one is deleted later (round 6 M1). Failures are ignored: the raw copy is then listed as "stale". */
   async function dropLegacy(def, guid) {
-    if (!hasLegacy(guid) || !(state.legacyOnly || []).some((r) => r.def === def && r.guid === guid)) return;
+    if (!hasRaw(def, guid)) return;
     try { await state.client.remove(state.lib.id, def, legacyLink(guid)); } catch (e) { console.warn("raw link not deleted", guid, e); }
   }
   /** "Премести": every record still under a raw-"$" link goes to its URL-encoded link, then the raw one is deleted.
@@ -589,6 +666,8 @@
   async function moveLegacy() {
     const list = state.legacyOnly || [];
     if (!list.length || !state.lib) return;
+    const bak = await backupFirst("move", list.filter((r) => rightFor(r.def)).flatMap((r) => [{ def: r.def, link: legacyLink(r.guid) }, { def: r.def, link: entLink(r.guid) }]), null, true);
+    if (bak === null) return;   // no undo file: stopped, the inline "Продължи без архив" asks (review 9 M5)
     let done = 0, failed = 0, skipped = 0, first = "";
     await pool(list, 6, async (r) => {
       if (!rightFor(r.def)) { skipped++; return; }
@@ -598,9 +677,11 @@
         if (rp) {
           const enc = await state.client.readOne(state.lib.id, r.def, entLink(r.guid));
           const ep = enc && enc.props;
+          // the kind is taken from these two fresh reads, not from the load (review 9 low 7)
+          const kind = !ep ? "move" : isStale(rp, ep) ? "stale" : "merge";
           let patch = null;
-          if (!ep) patch = rp;
-          else if (r.kind === "merge") {
+          if (kind === "move") patch = rp;
+          else if (kind === "merge") {
             patch = {};
             for (const [k, v] of Object.entries(rp)) if (k !== "log" && JSON.stringify(v) !== JSON.stringify(ep[k])) patch[k] = v;
             const extra = String(rp.log || "").split("\n").filter((l) => l && !String(ep.log || "").includes(l));
@@ -615,8 +696,9 @@
     await loadRecords();
     flash(L2(`Преместени ${done} записа.`, `Moved ${done} records.`) + (skipped ? ` · ${skipped} ${L2("без права", "no right")}` : "")
       + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
-      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failed > 0);
+      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize.") + bak, failed > 0);
     render();
+    if (state.coloured) await applyColours();   // DelivDate counts as delivered (owner's rule 16.11.2026)
   }
 
   // Clearing dates (admin): an empty Excel cell never clears a date, so this is the way to correct one or remove test
@@ -644,6 +726,9 @@
       let id = link.replace(/^frn:entity:/, ""); try { id = decodeURIComponent(id); } catch {}
       for (const [g, set] of ids) if (set.has(id) || set.has(id.toLowerCase())) found.get(g).add(link);
     }
+    // undo file: every stored link about to be deleted, with its props as listed just now
+    const bak = await backupFirst("fab-clear", list.flatMap((a) => [...found.get(a.guid), entLink(a.guid)].filter((l) => all.has(l)).map((link) => ({ def: F.DEF_ID, link }))), new Map([[F.DEF_ID, all]]), true);
+    if (bak === null) return;   // no undo file: stopped, the inline "Продължи без архив" asks (review 9 M5)
     let done = 0, failed = 0, first = "";
     await pool(list, 6, async (a) => {
       // other forms first, the encoded (visible) one last: a failure never leaves an old copy behind it (round 6 L1)
@@ -653,8 +738,9 @@
     });
     await loadRecords();
     flash(L2(`Изтрити дати: ${done} сглобки.`, `Dates cleared: ${done} assemblies.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
-      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failed > 0);
+      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize.") + bak, failed > 0);
     render();
+    if (state.coloured) await applyColours();   // DelivDate counts as delivered (owner's rule 16.11.2026)
   }
 
   async function applyFab() {
@@ -665,6 +751,7 @@
     if (!can("fab")) return setStatus(t("noRight"), true);
     // Each assembly is read fresh and written with its version: only the changed fields go out (never a stale copy of
     // the others), and an assembly someone else changed since the preview is skipped, not overwritten (round 5, M2/L4)
+    const bak = await backupFirst("fab-import", linksOf(F.DEF_ID, fp.p.changes.map((c) => c.ifc)));
     let done = 0, first = "";
     const failedList = [], meanwhile = [];
     await pool(fp.p.changes, 6, async (c) => {
@@ -702,8 +789,9 @@
     flash(L2(`Записани ${done} сглобки.`, `Saved ${done} assemblies.`)
       + (meanwhile.length ? L2(` · ${meanwhile.length} променени междувременно от друг – не са записани, импортирайте файла пак: `, ` · ${meanwhile.length} changed by someone else meanwhile – not saved, import the file again: `) + meanwhile.slice(0, 10).join(", ") + "." : "")
       + (failedList.length ? ` · ${failedList.length} ${L2("грешки", "failed")} (${first})` : "")
-      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize."), failedList.length + meanwhile.length > 0);
+      + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize.") + bak, failedList.length + meanwhile.length > 0);
     render();
+    if (state.coloured) await applyColours();   // DelivDate counts as delivered (owner's rule 16.11.2026)
   }
 
   // ---------- rendering ----------
@@ -725,9 +813,13 @@
       const states = new Map();
       for (const a of sel) { const s = av.state.get(a.guid); states.set(s, (states.get(s) || 0) + 1); }
       const fb = sel.map((a) => state.fab.get(a.guid) || {});
+      // a future DelivDate is planned, not delivered (R.fabDelivered, review 9 low 11)
+      const delivN = sel.filter((a) => R.fabDelivered(state.fab, a.guid)).length;
       const fabLine = sel.length === 1
-        ? [fb[0].FabDate && `${L2("изработен", "fabricated")} ${fmtDate(fb[0].FabDate)}`, fb[0].DelivDate && `${L2("доставен", "delivered")} ${fmtDate(fb[0].DelivDate)}`, fb[0].DelivNote && `${L2("СР", "DN")} ${fb[0].DelivNote}`].filter(Boolean).join(" · ")
-        : [fb.some((x) => x.FabDate) && `${L2("изработени", "fabricated")} ${fb.filter((x) => x.FabDate).length}`, fb.some((x) => x.DelivDate) && `${L2("доставени (Excel)", "delivered (Excel)")} ${fb.filter((x) => x.DelivDate).length}`].filter(Boolean).join(" · ");
+        ? [fb[0].FabDate && `${L2("изработен", "fabricated")} ${fmtDate(fb[0].FabDate)}`,
+          fb[0].DelivDate && (delivN ? `${L2("доставен", "delivered")} ${fmtDate(fb[0].DelivDate)}` : `${L2("доставка (план)", "delivery (planned)")} ${fmtDate(fb[0].DelivDate)}`),
+          fb[0].DelivNote && `${L2("СР", "DN")} ${fb[0].DelivNote}`].filter(Boolean).join(" · ")
+        : [fb.some((x) => x.FabDate) && `${L2("изработени", "fabricated")} ${fb.filter((x) => x.FabDate).length}`, delivN && `${L2("доставени (Excel)", "delivered (Excel)")} ${delivN}`].filter(Boolean).join(" · ");
       $("selText").innerHTML = `<b>${sel.length}</b> ${L2("сглобки", "assemblies")} · ${esc([...byMark].map(([m, n]) => (n > 1 ? `${m} (${n})` : m)).join(", "))}<div class="sub">${[...states].map(([s, n]) => `${esc(stateName(s))}: ${n}`).join(" · ")}</div>`
         + (fabLine ? `<div class="sub">${esc(L2("Производство", "Fabrication"))}: ${esc(fabLine)}</div>` : "");
     }
@@ -758,7 +850,7 @@
     $("acts").innerHTML = act("erected", "#2E7D32", state.status, can("status"), false, t("note"))
       + act("wrong", "#C62828", state.status, can("status"), true, t("note"))
       + act("hold", "#7B1FA2", state.holds, can("hold"), true, t("reason"));
-    renderMarks(av); renderDeliveries(); renderFab(); renderBolts(); renderDocs(av);
+    renderMarks(av); renderDeliveries(av); renderFab(); renderBolts(); renderDocs(av);
     const bl = $("build"); if (bl) bl.textContent = `Стомана v${BUILD}`;
   }
 
@@ -766,7 +858,7 @@
     const right = can("fab") && !state.fabError;
     const total = state.asms.length;
     const fabN = state.asms.filter((a) => (state.fab.get(a.guid) || {}).FabDate).length;
-    const delN = state.asms.filter((a) => (state.fab.get(a.guid) || {}).DelivDate).length;
+    const delN = state.asms.filter((a) => R.fabDelivered(state.fab, a.guid)).length;   // future dates are planned (review 9 low 11)
     const fp = state.fabPlan;
     const list = (title, items, cls) => (items.length ? `<div class="${cls || "warn"}"><b>${esc(title)}</b> (${items.length}): ${esc(items.slice(0, 12).join(" · "))}${items.length > 12 ? " …" : ""}</div>` : "");
     let preview = "";
@@ -790,7 +882,7 @@
         <div>${L2("Изработени", "Fabricated")}: <b>${fabN}</b> · ${L2("Доставени", "Delivered")}: <b>${delN}</b> / ${total}</div>
         <div class="bar"><label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel от производителя", "Import the fabricator's Excel")}<input type="file" id="fabFile" accept=".xlsx,.xls,.htm,.html" hidden></label>
           ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div>
-        ${legacyBanner()}
+        ${legacyBanner()}${noBackupBox()}
         ${isAdmin() && state.sel.length ? `<div class="bar"><button class="small secondary" data-act="clearFab">${esc(clearArmed()
           ? L2(`Потвърди: изтрий датите на ${state.sel.length} сглобки`, `Confirm: clear the dates of ${state.sel.length} assemblies`)
           : L2(`Изтрий датите на избраните (${state.sel.length})`, `Clear the dates of the selected (${state.sel.length})`))}</button></div>` : ""}
@@ -809,22 +901,28 @@
   }
   function renderMarks(av) {
     const over = av.marks.filter((m) => m.over);
-    $("tab-marks").innerHTML = legacyBanner() + (over.length ? `<div class="warn">${esc(L2("Монтирани повече от доставените: ", "Erected more than delivered: "))}${esc(over.map((m) => `${m.mark} (${m.erected}/${m.delivered})`).join(", "))}</div>` : "")
+    $("tab-marks").innerHTML = legacyBanner() + noBackupBox() + differsWarn(av) + (over.length ? `<div class="warn">${esc(L2("Монтирани повече от доставените: ", "Erected more than delivered: "))}${esc(over.map((m) => `${m.mark} (${m.erected}/${m.delivered})`).join(", "))}</div>` : "")
       + (av.unknownDeliveredMarks.length ? `<div class="warn">${esc(L2("Доставени марки, които ги няма в модела: ", "Delivered marks not in the model: "))}${esc(av.unknownDeliveredMarks.join(", "))}</div>` : "")
       + `<div class="scroll"><table><thead><tr><th>${L2("Марка", "Mark")}</th><th class="n">${L2("Бр.", "Qty")}</th><th class="n">${L2("Дост.", "Deliv.")}</th><th class="n">${L2("Монт.", "Erect.")}</th><th class="n" title="${esc(L2("доставени − монтирани", "delivered − erected"))}">${L2("Налични", "Available")}</th><th class="n">${L2("Не дост.", "Not del.")}</th></tr></thead><tbody>`
       + av.marks.map((m, i) => `<tr><td class="name"><button class="small secondary" data-act="pickMark" data-mark="${esc(m.mark)}" title="${esc(L2("Избери в модела", "Select in the model"))}">${esc(m.mark || "?")}</button>${m.hold ? ` <span class="sub">${L2("задърж.", "hold")} ${m.hold}</span>` : ""}${m.wrong ? ` <span class="bad sub">${L2("грешни", "wrong")} ${m.wrong}</span>` : ""}</td>
-        <td class="n">${m.instances}</td><td class="n">${m.delivered}</td><td class="n${m.over ? " bad" : ""}">${m.erected}</td><td class="n">${m.available}</td><td class="n">${m.notDelivered}</td></tr>`).join("")
+        <td class="n">${m.instances}</td><td class="n" title="${esc(m.source ? `${srcName(m.source)} · ${srcFigures(m)}` : "")}">${m.delivered}${m.source ? `<div class="sub${m.differs ? " bad" : ""}">${esc(m.differs ? srcFigures(m) : srcName(m.source))}</div>` : ""}</td><td class="n${m.over ? " bad" : ""}">${m.erected}</td><td class="n">${m.available}</td><td class="n">${m.notDelivered}</td></tr>`).join("")
       + `</tbody></table></div>`;
   }
 
-  function renderDeliveries() {
+  function renderDeliveries(av) {
     const right = can("status");
+    // delivered per mark from both sources (typed notes below + the fabricator's Excel on "Производство")
+    const got = av.marks.filter((m) => m.delivered > 0);
+    const byMarkBox = got.length ? `<div class="box" style="margin-top:6px"><div><b>${esc(L2("Доставени по марки", "Delivered by mark"))}</b> <span class="sub">${esc(L2("(по-голямото от въведените и Excel)", "(the larger of typed and Excel)"))}</span></div>
+      <div class="scroll"><table><thead><tr><th>${L2("Марка", "Mark")}</th><th class="n">${L2("Въведени", "Typed")}</th><th class="n">Excel</th><th class="n">${L2("Дост.", "Deliv.")}</th><th>${L2("Източник", "Source")}</th></tr></thead><tbody>`
+      + got.map((m) => `<tr><td>${esc(m.mark)}</td><td class="n">${m.typed}</td><td class="n">${m.excel}</td><td class="n${m.differs ? " bad" : ""}">${m.delivered}</td><td class="sub">${esc(srcName(m.source))}</td></tr>`).join("")
+      + `</tbody></table></div></div>` : "";
     const pend = state.dlvPending, dd = state.dlvDraft || {};
     const pendBox = pend ? `<div class="warn"><b>${esc(pend.source)}</b>: ${esc(L2(`${pend.lines.length} марки, ${pend.lines.reduce((n, l) => n + l.qty, 0)} бр.`, `${pend.lines.length} marks, ${pend.lines.reduce((n, l) => n + l.qty, 0)} pcs`))}
         <div class="sub">${esc(pend.lines.slice(0, 20).map((l) => `${l.mark}×${l.qty}`).join(", "))}${pend.lines.length > 20 ? " …" : ""}</div>
         <div class="sub">${esc(L2("Дата и № на стоковата разписка се вземат от полетата по-долу.", "Date and delivery note no. come from the fields below."))}</div>
         <div class="bar"><button class="small" data-act="dlvPendOk" ${right ? "" : "disabled"}>${esc(L2("Запиши доставката", "Save the delivery"))}</button><button class="small secondary" data-act="dlvPendNo">${esc(L2("Откажи", "Cancel"))}</button></div></div>` : "";
-    $("tab-deliveries").innerHTML = pendBox + `<div class="box">
+    $("tab-deliveries").innerHTML = pendBox + differsWarn(av) + `<div class="box">
         <div class="bar"><input type="date" id="dlvDate" max="${R.today()}" value="${esc(dd.dlvDate != null ? dd.dlvDate : R.today())}"><input type="text" id="dlvNo" value="${esc(dd.dlvNo || "")}" placeholder="${esc(L2("Стокова разписка №", "Delivery note no."))}"></div>
         <textarea id="dlvText" placeholder="${esc(L2("Марка и брой на ред, напр.\nRF22 3\nCL22 2", "Mark and qty per line, e.g.\nRF22 3\nCL22 2"))}">${esc(dd.dlvText || "")}</textarea>
         <div class="bar"><button class="small" data-act="dlvAdd" ${right ? "" : "disabled"}>${L2("Запиши доставка", "Save delivery")}</button>
@@ -838,7 +936,7 @@
             ? `<input type="text" id="dlvReason" placeholder="${esc(L2("Причина *", "Reason *"))}" style="width:90px"><div class="bar" style="margin:3px 0 0"><button class="small" data-act="dlvCancel" data-i="${i}">${L2("Анулирай", "Cancel it")}</button><button class="small secondary" data-act="dlvCancelNo">${L2("Не", "No")}</button></div>`
             : `<button class="small secondary" data-act="dlvCancel" data-i="${i}">${L2("Анулирай", "Cancel")}</button>`}</td></tr>`).join("")
         : `<tr><td colspan="4" class="sub">${L2("Няма доставки.", "No deliveries.")}</td></tr>`)
-      + `</tbody></table></div>`;
+      + `</tbody></table></div>` + byMarkBox;
     const f = $("dlvFile");
     if (f) f.onchange = (e) => guarded(async () => { const file = e.target.files[0]; e.target.value = ""; if (file) await importFile(file); });
   }
@@ -933,13 +1031,19 @@
   }
   async function exportMarks() {
     const av = avail();
-    const rows = [{ values: [L2("Марка", "Mark"), L2("Бр. в модела", "In model"), L2("Доставени", "Delivered"), L2("Монтирани", "Erected"), L2("Налични (дост. − монт.)", "Available (deliv. − erect.)"), L2("Светнали за монтаж", "Instances ready"), L2("Не доставени", "Not delivered"), L2("Задържани", "On hold"), L2("Грешни", "Wrong")], bold: true, fill: "FFECE8DF" }];
-    for (const m of av.marks) rows.push({ values: [m.mark, m.instances, m.delivered, m.erected, m.available, m.ready, m.notDelivered, m.hold, m.wrong] });
-    await saveXlsx("by-mark", [{ name: L2("По марки", "By mark"), rows, widths: [12, 10, 10, 10, 14, 14, 12, 10, 10] }]);
+    const rows = [{ values: [L2("Марка", "Mark"), L2("Бр. в модела", "In model"), L2("Доставени", "Delivered"), L2("Доставени: въведени", "Delivered: typed"), L2("Доставени: Excel", "Delivered: Excel"), L2("Източник", "Source"), L2("Монтирани", "Erected"), L2("Налични (дост. − монт.)", "Available (deliv. − erect.)"), L2("Светнали за монтаж", "Instances ready"), L2("Не доставени", "Not delivered"), L2("Задържани", "On hold"), L2("Грешни", "Wrong")], bold: true, fill: "FFECE8DF" }];
+    for (const m of av.marks) rows.push({ values: [m.mark, m.instances, m.delivered, m.typed, m.excel, srcName(m.source), m.erected, m.available, m.ready, m.notDelivered, m.hold, m.wrong] });
+    await saveXlsx("by-mark", [{ name: L2("По марки", "By mark"), rows, widths: [12, 10, 10, 12, 12, 16, 10, 14, 14, 12, 10, 10] }]);
   }
   async function exportDeliveries() {
     const rows = [{ values: [L2("Дата", "Date"), "№", L2("Марка", "Mark"), L2("Бр.", "Qty"), L2("От", "By"), L2("Източник", "Source"), L2("Анулирана", "Cancelled")], bold: true, fill: "FFECE8DF" }];
     for (const d of state.deliveries) for (const l of L.parseLines(d.lines)) rows.push({ values: [d.date, d.note_no || "", l.mark, l.qty, d.by || "", d.source || "", d.cancelled ? L2("да", "yes") : ""] });
+    // marks the fabricator's Excel counts higher than the typed notes: one row with the difference, so the sum per mark
+    // equals "Доставени" on the screen (review 9 low 12)
+    const xl = [...avail().byMark].filter(([, x]) => x.excel > x.typed).sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }));
+    const xlSrc = L2("Excel на производителя (с дата; + монтирани)", "Fabricator's Excel (dated; + erected)");
+    for (const [mark, x] of xl) rows.push({ values: ["", "", mark, x.excel - x.typed, "", xlSrc, ""] });
+    if (xl.length) rows.push({ values: [] }, { values: [L2(`Редовете „${xlSrc}“ допълват въведените доставки до „Доставени“ (по-голямото от въведените и Excel).`, `Rows "${xlSrc}" add to the typed deliveries up to "Delivered" (the larger of typed and Excel).`)] });
     await saveXlsx("deliveries", [{ name: L2("Доставки", "Deliveries"), rows, widths: [12, 14, 12, 8, 20, 20, 10] }]);
   }
 
@@ -982,6 +1086,16 @@
       else if (act === "fabApply") await applyFab();
       else if (act === "moveLegacy") await moveLegacy();
       else if (act === "clearFab") await clearFab();
+      else if (act === "noBackupGo") {   // second, explicit confirmation after a failed backup (review 9 M5)
+        const q = state.noBackupAsk; state.noBackupAsk = null;
+        if (!q) return;
+        state.noBackupOk = q.action;
+        try {
+          if (q.action === "move") await moveLegacy();
+          else if (q.action === "fab-clear") { state.fabClearArmed = Date.now(); await clearFab(); }
+        } finally { state.noBackupOk = null; }
+      }
+      else if (act === "noBackupNo") { state.noBackupAsk = null; setStatus(L2("Отказано – нищо не е променено.", "Cancelled – nothing was changed.")); render(); }
       else if (act === "fabCancel") { state.fabPlan = null; setStatus(L2("Импортът е отказан.", "Import cancelled.")); render(); }
       else if (act === "boltXlsx") await exportBoltsXlsx();
       else if (act === "boltPdf") exportBoltsPdf();
@@ -990,11 +1104,11 @@
       else if (act === "docDeliveries") await exportDeliveries();
     });
   });
-  $("btnSelClear").onclick = () => { state.sel = []; state.fabClearArmed = 0; state.flagArmed = null; state.drafts = {}; state.draftSel = null; render(); };
+  $("btnSelClear").onclick = () => { state.sel = []; state.fabClearArmed = 0; state.flagArmed = null; state.noBackupAsk = null; state.drafts = {}; state.draftSel = null; render(); };
   // typed dates and notes survive re-renders until saved or the selection is cleared (week 1, F6). They belong to the
   // selection they were typed for: adding pieces keeps them, any other selection drops them (round 8 M2).
   function selChanged() {
-    state.fabClearArmed = 0; state.flagArmed = null;   // a confirm never carries over to another selection (round 8 low 3)
+    state.fabClearArmed = 0; state.flagArmed = null; state.noBackupAsk = null;   // a confirm never carries over to another selection (round 8 low 3)
     if (state.draftSel && !state.draftSel.every((g) => state.sel.some((a) => a.guid === g))) { state.drafts = {}; state.draftSel = null; }
   }
   document.addEventListener("input", (e) => {
