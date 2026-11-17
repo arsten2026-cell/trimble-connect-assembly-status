@@ -75,7 +75,7 @@
     fab: new Map(), fabPlan: null,   // fabrication dates per IFC GUID (fabrication.js); the import waiting for "Save"
     sel: [], coloured: true, tab: "marks", boltScope: "all", follow: true,   // colouring on by default, remembered per user (week 3, A7)
     markFilter: "",   // search above the Марки table (A5)
-    fabFiles: { list: [], loading: false, error: "", missing: false, at: 0, busy: null },   // _ArstenDocs/Fabrication (B-Office 1)
+    fabFiles: { list: [], loading: false, error: "", missing: false, at: 0, busy: null },   // _AM_Docs/Fabrication (B-Office 1)
     drafts: {}, flagArmed: null, dlvPending: null,   // typed date/note per card kept across selection changes (F6); big-write confirm (F1); delivery file waiting for "Запиши" (F7)
     noBackupAsk: null, noBackupOk: null,   // failed undo file before fab-clear / Премести: the inline question, and the action confirmed without one (review 9 M5)
   };
@@ -538,7 +538,7 @@
   let backupCore = null;
   const coreFor = () => window.ARSTEN_PHOTOS_CORE || backupCore || (backupCore = ArstenBackup.coreClient(ArstenAccess.coreBase(state.project.location), getToken));
   /** Snapshot of the records [{def, link}] an action is about to change or delete, read fresh (or taken from `known`,
-   *  Map def -> Map link -> props), uploaded to _ArstenDocs/Backups/<day>/ before the action runs. Upload failed: the
+   *  Map def -> Map link -> props), uploaded to _AM_Docs/Backups/<day>/ before the action runs. Upload failed: the
    *  JSON is downloaded in the browser and the action goes on. A failed READ stops the action: nothing changes without
    *  its undo file. Returns the text added to the result message.
    *  Review 9: no window.ArstenBackup -> the action stops (low 14); a batch-get that echoed a requested link in the
@@ -942,10 +942,18 @@
   }
 
   // ---------- the fabricator's files in Connect (week 3, B-Office 1) ----------
-  // Read only: lists _ArstenDocs/Fabrication and its subfolders (Core 2.0, the same client as the undo files), never
+  // Read only: lists _AM_Docs/Fabrication and its subfolders (Core 2.0, the same client as the undo files), never
   // creates a folder. "Внеси" downloads the file (files/fs/{id}/downloadurl) and runs the same preview as a picked file;
   // the import keeps its preview, "Запиши" and undo file.
-  const FAB_FOLDER = ["_ArstenDocs", "Fabrication"];
+  // The project's tool folder is _AM_Docs (renamed from _ArstenDocs on 17.11.2026, one name for Arsten and Multiplan).
+  // Lookups take _AM_Docs first and fall back to an old _ArstenDocs; only _AM_Docs is ever created.
+  const DOCS = "_AM_Docs", DOCS_OLD = "_ArstenDocs";
+  const pickFolder = (list, name, same) => {
+    const eq = same || ((a, b) => a === b);
+    const isF = (x) => !!x && String(x.type || "").toUpperCase() === "FOLDER";
+    return (list || []).find((x) => isF(x) && eq(x.name, name)) || (name === DOCS ? (list || []).find((x) => isF(x) && eq(x.name, DOCS_OLD)) : undefined);
+  };
+  const FAB_FOLDER = [DOCS, "Fabrication"];
   const itemsOf = (it) => (Array.isArray(it) ? it : (it && it.items) || []);
   const isFolder = (x) => String((x && x.type) || "").toUpperCase() === "FOLDER";
   async function listFabFiles() {
@@ -954,7 +962,7 @@
     let id = p && p.rootId;
     if (!id) throw new Error(L2("основната папка на проекта не е намерена", "project root folder not found"));
     for (const name of FAB_FOLDER) {
-      const f = itemsOf(await core.req(`folders/${encodeURIComponent(id)}/items`)).find((x) => isFolder(x) && String(x.name).toLowerCase() === name.toLowerCase());
+      const f = pickFolder(itemsOf(await core.req(`folders/${encodeURIComponent(id)}/items`)), name, (a, b) => String(a).toLowerCase() === b.toLowerCase());
       if (!f) return { missing: true, files: [] };
       id = f.id;
     }
@@ -1019,11 +1027,11 @@
     }).join("");
     const body = ff.loading || !ff.at ? `<div class="sub">${esc(L2("Чета папката…", "Reading the folder…"))}</div>`
       : ff.error ? `<div class="warn">${esc(L2("Папката не може да се прочете: ", "The folder cannot be read: ") + ff.error)}</div>`
-      : ff.missing ? `<div class="sub">${esc(L2("Папката _ArstenDocs/Fabrication още не съществува в проекта.", "The folder _ArstenDocs/Fabrication does not exist in the project yet."))}</div>`
+      : ff.missing ? `<div class="sub">${esc(L2("Папката _AM_Docs/Fabrication още не съществува в проекта.", "The folder _AM_Docs/Fabrication does not exist in the project yet."))}</div>`
       : !ff.list.length ? `<div class="sub">${esc(L2("Няма файлове .xlsx / .xls в папката.", "No .xlsx / .xls files in the folder."))}</div>`
       : `<div class="scroll"><table><thead><tr><th>${esc(L2("Файл", "File"))}</th><th>${esc(L2("Качен", "Uploaded"))}</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
     return `<div class="box" style="margin-top:6px"><div class="bar" style="margin-top:0"><b>${esc(L2("Файлове от производителя", "Files from the fabricator"))}</b>
-      <span class="sub">_ArstenDocs/Fabrication</span><button class="small secondary" data-act="fabFilesRefresh" style="margin-left:auto" ${ff.loading ? "disabled" : ""}>${esc(L2("Обнови", "Refresh"))}</button></div>${body}
+      <span class="sub">_AM_Docs/Fabrication</span><button class="small secondary" data-act="fabFilesRefresh" style="margin-left:auto" ${ff.loading ? "disabled" : ""}>${esc(L2("Обнови", "Refresh"))}</button></div>${body}
       ${state.fabPlan && ff.list.length ? `<div class="sub">${esc(L2("Първо запишете или откажете прегледания импорт.", "First save or cancel the import being previewed."))}</div>` : ""}</div>`;
   }
 

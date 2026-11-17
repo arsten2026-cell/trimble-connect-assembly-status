@@ -285,7 +285,7 @@
     return { names, ids, manual };
   }
   /**
-   * A file in _ArstenDocs/Fabrication, decided by its Connect file id + version as recorded in the history line
+   * A file in _AM_Docs/Fabrication, decided by its Connect file id + version as recorded in the history line
    * ("file:<id> v:<ver>"), never by its name alone (review 10, M4):
    *  - "imported" ("внесен"): this id with this very version was imported;
    *  - "newVersion" ("нова версия"): this id was imported, but only other versions of it;
@@ -323,7 +323,7 @@
   }
   const FAB_EXT = /\.(xlsx|xls|htm|html)$/i;
   const personName = (p) => (p && typeof p === "object" ? [p.firstName, p.lastName].filter(Boolean).join(" ") || p.email || "" : String(p || ""));
-  /** Core 2.0 folder items found under _ArstenDocs/Fabrication ([{item, path}], path = subfolder) -> the fabricator's
+  /** Core 2.0 folder items found under _AM_Docs/Fabrication ([{item, path}], path = subfolder) -> the fabricator's
    *  files, newest first: [{id, versionId, name, path, modified, by, size}]. */
   function fabFiles(entries) {
     return (entries || []).filter((e) => e && e.item && String(e.item.type || "FILE").toUpperCase() === "FILE" && FAB_EXT.test(String(e.item.name || "")))
