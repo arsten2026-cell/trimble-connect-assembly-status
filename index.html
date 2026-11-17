@@ -60,6 +60,36 @@
     .act .row { gap:8px; }
   }
   .cnt { display:inline-block; min-width:18px; padding:0 4px; font-size:11px; background:#ece8df; text-align:center; }
+  /* week 3, A7: the view section is prominent, with a switch */
+  .viewbox { background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--accent); padding:8px 10px; margin:4px 0 10px; }
+  .viewbox .viewhd { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .viewbox h2 { margin:0; margin-right:auto; }
+  .switch { display:inline-flex; align-items:center; gap:8px; font-size:13px; font-weight:600; cursor:pointer; user-select:none; }
+  .switch input { appearance:none; -webkit-appearance:none; flex:none; width:40px; height:22px; margin:0; background:#c9c4b8; position:relative; cursor:pointer; transition:background .15s; }
+  .switch input::after { content:""; position:absolute; top:3px; left:3px; width:16px; height:16px; background:#fff; transition:left .15s; }
+  .switch input:checked { background:var(--accent); }
+  .switch input:checked::after { left:21px; }
+  .switch input:focus-visible { outline:2px solid var(--ink); outline-offset:2px; }
+  .legend.big { font-size:12px; gap:6px 12px; margin:8px 0 0; }
+  .legend.big .sw { width:14px; height:14px; vertical-align:-2px; }
+  .legend.off { opacity:.5; }
+  .legend .li { white-space:nowrap; }
+  /* A5 mark search */
+  .search { display:flex; gap:8px; align-items:center; margin:6px 0; }
+  .search input { flex:1; min-width:0; font:inherit; font-size:13px; padding:5px 7px; border:1px solid var(--line); border-radius:0; background:#fff; }
+  /* A13 last import, B-Office 1 file badges */
+  .keep { background:#fff; border:1px solid var(--line); border-left:4px solid var(--accent); padding:7px 8px; font-size:12px; margin:6px 0; }
+  .badge { display:inline-block; padding:1px 6px; font-size:11px; white-space:nowrap; }
+  .badge.new { background:var(--accent); color:#fff; }
+  .badge.done { background:#ece8df; color:var(--muted); }
+  .badge.maybe { border:1px solid var(--accent); color:var(--accent); padding:0 5px; }
+  @media (pointer: coarse) {
+    .switch { min-height:40px; font-size:15px; }
+    .switch input { width:48px; height:28px; }
+    .switch input::after { width:22px; height:22px; }
+    .switch input:checked::after { left:23px; }
+    .search input { min-height:40px; font-size:16px; }
+  }
 </style>
 </head>
 <body>
@@ -69,6 +99,12 @@
 <div id="setupBox" class="warn" hidden></div>
 
 <div id="main" hidden>
+  <div class="viewbox">
+    <div class="viewhd"><h2 id="hView"></h2>
+      <label class="switch"><input type="checkbox" id="chkColour" role="switch" checked> <span id="lblColour"></span></label></div>
+    <div id="legend" class="legend big"></div>
+  </div>
+
   <h2 id="hSel"></h2>
   <div class="box">
     <div id="selText"></div>
@@ -76,10 +112,6 @@
       <button id="btnSelClear" class="small secondary"></button></div>
   </div>
   <div id="acts"></div>
-
-  <h2 id="hView"></h2>
-  <div class="bar" style="margin:0"><label class="chk"><input type="checkbox" id="chkColour"> <span id="lblColour"></span></label></div>
-  <div id="legend" class="legend"></div>
 
   <div class="tabs" id="tabs">
     <button data-tab="marks"></button><button data-tab="deliveries"></button><button data-tab="fab"></button><button data-tab="bolts"></button><button data-tab="docs"></button>
@@ -94,12 +126,13 @@
 <div id="toast" role="status" aria-live="polite"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/trimble-connect-workspace-api@0.3.38/dist/iife/trimbleconnect.workspace.api.js" integrity="sha384-lFiNt/56q6HnUNbuy0WHO3NP6BkQjY4EH8+5eELYVfnhkB42snRTmSa3UOAlX9gg" crossorigin="anonymous"></script>
-<script src="arsten-access.js?v=c29c3b3f4f"></script>
-<script src="psetapi.js?v=cb56112323"></script>
-<script src="steel.js?v=4ad21ffc5c"></script>
+<script src="arsten-perf.js?v=21f7454938"></script>
+<script src="arsten-access.js?v=b6f528e602"></script>
+<script src="psetapi.js?v=3ecda69f18"></script>
+<script src="steel.js?v=e18723746a"></script>
 <script src="records.js?v=f037461491"></script>
 <script src="fabrication.js?v=4c88ed8002"></script>
-<script src="arsten-backup.js?v=28ec966847"></script>
-<script src="app.js?v=cd981eef73"></script>
+<script src="arsten-backup.js?v=6474f7830d"></script>
+<script src="app.js?v=d27ba0173e"></script>
 </body>
 </html>

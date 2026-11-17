@@ -8,6 +8,7 @@
   const L = window.SteelLogic, R = window.SteelRecords, A = window.PsetApi, F = window.SteelFab;
   const $ = (id) => document.getElementById(id);
   const BATCH = 200;
+  const RECORD_POOL = 5;   // pset-api batch-get calls at once while loading the records (speed audit item 1: cap 4-6)
   const ELEMENT_ASSEMBLY = 4;   // HierarchyType.ElementAssembly
   const T = {
     title: ["Стомана", "Steel"],
@@ -40,6 +41,17 @@
   const BUILD = ((document.currentScript && /[?&]v=(\d+)/.exec(document.currentScript.src)) || [])[1] || "dev";
   const errText = (e) => (e && (e.message || e.toString())) || String(e);
   async function guarded(fn) { try { await fn(); } catch (e) { flash(L2("Грешка: ", "Error: ") + errText(e), true); console.error(e); } }
+  // Writes vs. a model reload (review 10 M3, as Монолитен бетон round 8 M4): a reload waits while writes are in flight,
+  // the write buttons are refused while a load runs, and a write that still lands during a load is put back over the
+  // load's older read (book.replay in loadRecords), so it never disappears from the screen.
+  let inflight = 0;
+  const book = L.writeBook();
+  async function writing(fn) { inflight++; try { return await fn(); } finally { inflight--; } }
+  /** A record just written: into the live map (never one captured before an await) and into the book. */
+  function keepRec(field, guid, rec) {
+    if (rec == null) state[field].delete(guid); else state[field].set(guid, rec);
+    book.add(field, guid, rec);
+  }
   async function pool(items, n, fn) {
     let next = 0;
     await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (next < items.length) { const k = next++; await fn(items[k], k); } }));
@@ -47,10 +59,13 @@
 
   const state = {
     api: null, client: null, project: null, user: "", access: null, lib: null, ready: false,
-    asms: [], byKey: new Map(), byGuid: new Map(),   // assembly instances {modelId, id, guid, mark, layer, weight, finish, parts:[runtime ids]}
+    partsReady: false, partsError: "",   // phase B of a load (parts, bolts) done / its error (audit item 2)
+    asms: [], byKey: new Map(), byGuid: new Map(), asmOfChild: new Map(),   // assembly instances {modelId, id, guid, mark, layer, weight, finish, parts:[runtime ids]}
     bolts: [], status: new Map(), holds: new Map(), deliveries: [],
     fab: new Map(), fabPlan: null,   // fabrication dates per IFC GUID (fabrication.js); the import waiting for "Save"
-    sel: [], coloured: false, tab: "marks", boltScope: "all", follow: true,
+    sel: [], coloured: true, tab: "marks", boltScope: "all", follow: true,   // colouring on by default, remembered per user (week 3, A7)
+    markFilter: "",   // search above the Марки table (A5)
+    fabFiles: { list: [], loading: false, error: "", missing: false, at: 0, busy: null },   // _ArstenDocs/Fabrication (B-Office 1)
     drafts: {}, flagArmed: null, dlvPending: null,   // typed date/note per card kept across selection changes (F6); big-write confirm (F1); delivery file waiting for "Запиши" (F7)
     noBackupAsk: null, noBackupOk: null,   // failed undo file before fab-clear / Премести: the inline question, and the action confirmed without one (review 9 M5)
   };
@@ -66,22 +81,54 @@
   // a raw-"$" copy already contained in the encoded record (same record, or its last history line is there): only deleted
   const lastLine = (log) => String(log || "").split("\n").filter(Boolean).pop() || "";
   const isStale = (raw, enc) => { const rl = lastLine(raw.log); return JSON.stringify(raw) === JSON.stringify(enc) || (rl !== "" && String(enc.log || "").includes(rl)); };
+  // Rights follow every group the user is in (round 11, M4) and the server lock (M3): statuses, deliveries and the
+  // fabrication import need a group with Edit (ArstenAccess.canWrite: 00_ADMIN, 02, 02.1); a Connect project ADMIN outside
+  // them gets the panel read-only. Holds: those, plus designers (04 / 4.1 have Edit on Assembly hold).
   const can = (what) => {
-    const r = state.access && state.access.role;
     if (window.ARSTEN_DEMO) return true;
+    const a = state.access;
     if (what === "fab") what = "status";   // fabrication import: same people as statuses for now; a fabricator group later (round 5, L10)
-    return what === "hold" ? ["admin", "gc", "designer"].includes(r) : ["admin", "gc"].includes(r);
+    return what === "hold" ? ArstenAccess.canWrite(a) || ArstenAccess.hasRole(a, "designer") : ArstenAccess.canWrite(a);
   };
+  /** Why a write button is off: an admin outside the Edit groups is told how to get write access (M3). */
+  const noRight = () => (!window.ARSTEN_DEMO && ArstenAccess.hasRole(state.access, "admin") && !ArstenAccess.canWrite(state.access)
+    ? L2("Само преглед: добавете се в 00_ADMIN, за да записвате.", "Read only: add yourself to 00_ADMIN to save.") : t("noRight"));
+  // Who is looking (week 3, A8; round 11, M5): the same rule as Монолитен бетон (ArstenAccess.side). Site roles do not
+  // see the Производство tab, the "стар формат / Премести" banner, load diagnostics or raw GUIDs. Office = admin, the PM
+  // side (the "stages" cap), designers, fabricator.
+  const office = () => ArstenAccess.side(state.access) === "office";
+
+  // ---------- view options, remembered per user in this browser (week 3, A7) ----------
+  const viewKey = () => "arsten.assemblyStatus.view:" + (state.userId || "anon");
+  function loadView() {
+    let raw = null;
+    try { raw = localStorage.getItem(viewKey()); } catch {}
+    const v = L.readView(raw);
+    state.coloured = v.coloured; state.follow = v.follow; state.tab = v.tab;
+  }
+  function saveView() {
+    try { localStorage.setItem(viewKey(), JSON.stringify({ coloured: state.coloured, follow: state.follow, tab: state.tab })); } catch {}
+  }
 
   // ---------- token ----------
   let token = null, waiters = [];
   function onToken(tk) { token = tk; const w = waiters; waiters = []; w.forEach((f) => f(tk)); }
+  // The waiter is registered before asking (the token event may come while requestPermission runs). When Connect
+  // returns the token directly, or refuses, the waiter and its 60 s timer are dropped, so no unobserved promise is
+  // rejected a minute later (review round 12, L6).
   async function getToken(refresh) {
     if (token && !refresh) return token;
-    const p = new Promise((resolve, reject) => { waiters.push(resolve); setTimeout(() => reject(new Error("No access token from Trimble Connect")), 60000); });
-    const r = await state.api.extension.requestPermission("accesstoken");
-    if (r === "denied") throw new Error("Access to Trimble Connect data was denied for this extension.");
-    if (r && r !== "pending" && r !== "granted") { token = r; return r; }
+    let timer = 0, done = null;
+    const p = new Promise((resolve, reject) => {
+      done = (tk) => { clearTimeout(timer); resolve(tk); };
+      waiters.push(done);
+      timer = setTimeout(() => { waiters = waiters.filter((f) => f !== done); reject(new Error("No access token from Trimble Connect")); }, 60000);
+    });
+    const drop = () => { clearTimeout(timer); waiters = waiters.filter((f) => f !== done); p.catch(() => {}); };
+    let r;
+    try { r = await state.api.extension.requestPermission("accesstoken"); } catch (e) { drop(); throw e; }
+    if (r === "denied") { drop(); throw new Error("Access to Trimble Connect data was denied for this extension."); }
+    if (r && r !== "pending" && r !== "granted") { drop(); token = r; return r; }
     return p;
   }
 
@@ -179,17 +226,35 @@
     }
   }
 
+  // Children of each assembly per loaded model, kept for the panel's session (speed audit item 2a; steel.js childCache).
+  const childCache = L.childCache();
+  /** getModels("loaded"); [] when the call fails (the model set then counts as changed, L.modelSetKey). */
+  async function loadedModels() {
+    try { return (await state.api.viewer.getModels("loaded")) || []; } catch { return []; }
+  }
+  /** modelId -> version id of the loaded models (getModels may list a model under its file id or its version id). A
+   *  model it does not list gets no version, and its children are then never taken from the cache. */
+  function modelVersions(specs) {
+    const out = new Map();
+    for (const m of specs || []) {
+      if (!m || !m.versionId) continue;
+      if (m.id != null) out.set(m.id, m.versionId);
+      out.set(m.versionId, m.versionId);
+    }
+    return out;
+  }
+
   /**
-   * Reads assemblies and bolts of the loaded models. Builds everything into local variables and assigns to state only
-   * at the end; returns false (and changes nothing) when a newer load started meanwhile, e.g. a stage that loads and
-   * unloads models fires several model events while a slow load is still running (review round 2, #3).
+   * Phase A of a load (audit item 2, smallest step): the assemblies of the loaded models (marks, GUIDs, weights), which
+   * is all the Марки / Доставки / Документи tabs and every write need. Assigns them to state with empty part maps
+   * (state.partsReady false) and returns {asms, byKey, dupAsms}; null (and changes nothing) when a newer load started
+   * meanwhile, e.g. a stage that loads and unloads models fires several model events (review round 2, #3).
    */
-  async function loadModel(gen) {
+  async function loadAssemblies(gen, ctx) {
     const stale = () => gen !== loadGen;
-    const ctx = { stale, all: null, failed: 0 };   // this load's own object cache and lookup failures
     setStatus(L2("Чета сглобките…", "Reading assemblies…"));
     const raw = await readClass("IfcElementAssembly", /^Assembly/i, ctx);
-    if (stale()) return false;
+    if (stale()) return null;
     // the same assembly in two loaded models (overlapping exports, two versions): keep the first, warn (#11)
     const seenGuid = new Set();
     let dupAsms = 0;
@@ -201,20 +266,54 @@
         layer: val(a.ps, /^Layer/i) || "", weight: val(a.ps, /Assembly_Weight/i) || "", finish: val(a.ps, /^Finish/i) || "", parts: [] });
     }
     const byKey = new Map(asms.map((a) => [key(a.modelId, a.id), a]));
-    const byGuid = new Map(asms.map((a) => [a.guid, a]));
+    // everything of the assemblies at once; the part maps and bolts of the last load are dropped together (they point
+    // at its assembly objects) and come with phase B
+    state.asms = asms; state.byKey = byKey; state.byGuid = new Map(asms.map((a) => [a.guid, a]));
+    state.asmOfChild = new Map(); state.bolts = []; state.partsReady = false; state.partsError = "";
+    allObjects = ctx.all;
+    return { asms, byKey, dupAsms };
+  }
+  /**
+   * Phase B, in the background after phase A: the parts of each assembly (hierarchy children), the bolts and their
+   * sides. Builds into local variables and assigns to state only at the end (state.partsReady = true); returns false
+   * (and changes nothing) when a newer load started meanwhile. Nothing written depends on it: until it ends the colours
+   * wait, the Болтове tab and a box-select of parts show "зареждане на частите…", a mark picked in the table is
+   * selected in the model when it ends, and one clicked part is asked from the viewer (getHierarchyParents).
+   */
+  async function loadParts(gen, ctx, got, versions) {
+    const stale = () => gen !== loadGen;
+    const { asms, byKey, dupAsms } = got;
+    const partsOf = new Map();   // assembly -> child runtime ids of this load (put on the assemblies only at the end)
     // children of each assembly (parts and, in Tekla IFC, its bolts): one call per ASSEMBLY, reused below so the bolts
     // need no call each (4000 bolts used to mean ~8000 one-by-one calls; user 15.11.2026)
-    const asmOfChild = new Map();   // key(model, child runtime id) -> assembly
+    // Kept per model for the session (speed audit item 2a): a reload or stage switch that leaves a model loaded with the
+    // same version and the same assemblies (runtime id = GUID) reads no children for it again. What is read is unchanged.
+    const nextKids = new Map();   // modelId -> {sig, kids: Map(assembly runtime id -> child ids)} of this load
+    const todoA = [];
+    for (const a of asms) {
+      if (!nextKids.has(a.modelId)) {
+        const sig = L.modelSig(versions.get(a.modelId), asms.filter((x) => x.modelId === a.modelId));
+        nextKids.set(a.modelId, { sig, kids: new Map(), old: childCache.take(a.modelId, sig) });
+      }
+      const e = nextKids.get(a.modelId), c = e.old && e.old.get(a.id);
+      if (c) { partsOf.set(a, c.slice()); e.kids.set(a.id, c); } else todoA.push(a);
+    }
     let doneA = 0, childErrors = 0;
-    await pool(asms, 8, async (a) => {
+    const t0 = Date.now();
+    await A.mapLimit(todoA, 8, async (a) => {
       if (stale()) return;
-      try { a.parts = ((await state.api.viewer.getHierarchyChildren(a.modelId, [a.id], ELEMENT_ASSEMBLY)) || []).map((c) => c.id); }
-      catch { a.parts = []; childErrors++; }
-      for (const id of a.parts) asmOfChild.set(key(a.modelId, id), a);
-      if (++doneA % 50 === 0 && !stale()) setStatus(L2(`Чета сглобките… ${doneA} от ${asms.length}`, `Reading assemblies… ${doneA} of ${asms.length}`));
+      try {
+        const kids = ((await state.api.viewer.getHierarchyChildren(a.modelId, [a.id], ELEMENT_ASSEMBLY)) || []).map((c) => c.id);
+        partsOf.set(a, kids);
+        if (kids.length) nextKids.get(a.modelId).kids.set(a.id, kids.slice());   // an empty answer is never kept
+      } catch { partsOf.set(a, []); childErrors++; }
+      if (++doneA % 50 === 0 && !stale()) partsProgress(doneA, todoA.length);
     });
+    const childMs = Date.now() - t0;
+    if (todoA.length) console.info(`[Стомана] getHierarchyChildren: ${todoA.length} calls (pool 8) in ${childMs} ms; ${asms.length - todoA.length} assemblies from the session cache`);
     if (stale()) return false;
-    setStatus(L2("Чета болтовете…", "Reading bolts…"));
+    const asmOfChild = new Map();   // key(model, child runtime id) -> assembly; kept in state for the selection (item 9a)
+    for (const a of asms) for (const id of partsOf.get(a) || []) asmOfChild.set(key(a.modelId, id), a);
     const rawBolts = await readClass("IfcMechanicalFastener", /^Bolt/i, ctx);
     if (stale()) return false;
     // a bolt group loaded twice (two overlapping models) is counted once (#11)
@@ -223,7 +322,7 @@
     const fs = rawBolts.filter((f) => { if (seenBolt.has(f.guid)) { dupBolts++; return false; } seenBolt.add(f.guid); return true; });
     // bolts are not parts: keep them out of the parts lists (colouring)
     const boltKeys = new Set(rawBolts.map((f) => key(f.modelId, f.id)));
-    for (const a of asms) a.parts = a.parts.filter((id) => !boltKeys.has(key(a.modelId, id)));
+    for (const a of asms) partsOf.set(a, (partsOf.get(a) || []).filter((id) => !boltKeys.has(key(a.modelId, id))));
     const assemblyOfPart = new Map();
     // main parts: Tekla GUID -> IFC GlobalId -> runtime id, in batches of 500 per model, then its assembly from the map
     const mainByModel = new Map();
@@ -265,7 +364,7 @@
       if (stale()) return;
       let own = asmOfChild.get(key(f.modelId, f.id)) || null;
       if (!own) { slow++; try { own = await parentAssembly(f.modelId, f.id, byKey); } catch { own = null; } }
-      if (++doneB % 200 === 0 && !stale()) setStatus(L2(`Чета болтовете… ${doneB} от ${fs.length}`, `Reading bolts… ${doneB} of ${fs.length}`));
+      if (++doneB % 200 === 0 && !stale()) partsProgress(doneB, fs.length, true);
       const hasLinks = Object.keys(f.ps).some((k) => /Main_Part_GUID|Connected_Assemblies/i.test(k));
       const mainPart = String(val(f.ps, /Main_Part_GUID/i) || "").trim();
       const ca = val(f.ps, /Connected_Assemblies/i);
@@ -277,7 +376,7 @@
     if (stale()) return false;
     // fallback geometry only for bolts without a usable Main_Part_GUID (old exports)
     const needFallback = bolts.some((b) => b.otherMarks && b.otherMarks.length && !assemblyOfPart.get(L.tcGuidToIfc(b.mainPart)));
-    const assemblies = needFallback ? await assemblyBoxes(asms) : [];
+    const assemblies = needFallback ? await assemblyBoxes(asms, partsOf) : [];
     if (needFallback) {
       const byModel = new Map();
       for (const b of bolts) { if (!byModel.has(b.modelId)) byModel.set(b.modelId, []); byModel.get(b.modelId).push(b); }
@@ -293,18 +392,23 @@
     if (exportHasLinks) for (const b of bolts) if (b.otherMarks == null) b.otherMarks = [];
     for (const b of bolts) b.sides = b.ownGuid ? L.resolveSides(b, { assemblyOfPart, assemblies, opts: { abs: 0.2, rel: 0.1 } }) : { unresolved: "no-own-assembly" };
     // everything at once, so the panel never shows half of one load and half of another
-    state.asms = asms; state.byKey = byKey; state.byGuid = byGuid;
+    for (const a of asms) a.parts = partsOf.get(a) || [];
+    state.asmOfChild = asmOfChild;
     state.bolts = bolts;
-    state.loadStats = { assemblies: asms.length, bolts: bolts.length, slowLookups: slow, dupAsms, dupBolts, childErrors, lookupFailed: ctx.failed };
+    childCache.keep(nextKids);
+    state.loadStats = { assemblies: asms.length, bolts: bolts.length, slowLookups: slow, dupAsms, dupBolts, childErrors, lookupFailed: ctx.failed,
+      childCalls: todoA.length, childCached: asms.length - todoA.length, childMs: Math.round(childMs) };
     allObjects = ctx.all;
     state.hasLinks = exportHasLinks;
+    state.partsReady = true;
     return true;
   }
-  async function assemblyBoxes(asms) {
+  async function assemblyBoxes(asms, partsOf) {
     const out = [];
     for (const a of asms) {
+      const parts = partsOf.get(a) || [];
       let boxes = [];
-      try { boxes = ((await state.api.viewer.getObjectBoundingBoxes(a.modelId, a.parts.length ? a.parts : [a.id])) || []).map((x) => x.boundingBox).filter(Boolean); } catch {}
+      try { boxes = ((await state.api.viewer.getObjectBoundingBoxes(a.modelId, parts.length ? parts : [a.id])) || []).map((x) => x.boundingBox).filter(Boolean); } catch {}
       out.push({ guid: a.guid, mark: a.mark, boxes });
     }
     return out;
@@ -316,6 +420,7 @@
    *  (after a save) it always assigns. */
   async function loadRecords(gen) {
     const current = () => gen === undefined || gen === loadGen;
+    const since = book.mark();   // writes landing after this may be missing from the reads below (M3)
     const found = await state.client.findLibrary(state.project.id, R.LIB_NAMES);
     if (!current()) return false;
     if (!found.lib) {
@@ -340,9 +445,7 @@
     // has history the encoded one lacks (an old cached client wrote it after the move, round 6 M2) - its fields win;
     // "stale" = the raw one is an old copy already contained in the encoded record - only deleted.
     const legacyOnly = [];
-    const readBoth = async (def) => {
-      const old = legacy.length ? toMap(await state.client.readMany(state.lib.id, def, legacy)) : new Map();
-      const cur = toMap(await state.client.readMany(state.lib.id, def, links));
+    const merge = (def, old, cur) => {
       const out = new Map(cur);
       for (const [g, p] of old) {
         if (!cur.has(g)) { legacyOnly.push({ def, guid: g, kind: "move" }); out.set(g, p); }
@@ -351,21 +454,39 @@
       }
       return out;
     };
-    const status = await readBoth(R.DEF.status);
-    const holds = await readBoth(R.DEF.hold);
     // fabrication dates: an admin's first visit creates the definition; until then there is nothing to read. Any
     // error here only disables the Производство tab, never the rest of Стомана (round 5, M3)
+    let fabFail = null;
+    try { await state.client.ensureDefinition(state.lib.id, F.definition()); } catch (e) { if (e.status !== 403) fabFail = e; }
+    // status, hold and fabrication, each under the encoded and (for "$" GUIDs) the raw legacy link: every 100-link call
+    // of all of them at most RECORD_POOL at once, with retry on 429/503 (speed audit item 1; were one after the other).
+    // The deliveries are listed at the same time. A status / hold error fails the load as before; a fabrication error
+    // only empties the Производство tab.
+    const both = (def, soft) => [{ def, form: "old", links: legacy, soft }, { def, form: "cur", links, soft }];
+    const reads = both(R.DEF.status, false).concat(both(R.DEF.hold, false), fabFail ? [] : both(F.DEF_ID, true));
+    const jobs = L.chunkReads(reads, 100);
+    const readJob = (j) => A.mapLimit([j], 1, (x) => state.client.readMany(state.lib.id, x.def, x.links)).then((r) => r[0]);   // 429/503 retried
+    const t0 = Date.now();
+    const [got, dels] = await Promise.all([
+      A.mapLimit(jobs, RECORD_POOL, async (j) => {
+        if (!current() || (j.soft && fabFail)) return null;   // a newer load took over / the fabrication read already failed
+        if (!j.soft) return readJob(j);
+        try { return await readJob(j); } catch (e) { if (!fabFail) fabFail = e; return null; }
+      }, { retries: 0 }),
+      state.client.listAll(state.lib.id, R.DEF.delivery, R.deliveryPrefix(state.project.id)),
+    ]);
+    console.info(`[Стомана] records: ${jobs.length} batch-get calls (pool ${RECORD_POOL}) + deliveries in ${Date.now() - t0} ms`);
+    const res = L.joinReads(reads, jobs, got).map(toMap);
+    const status = merge(R.DEF.status, res[0], res[1]);
+    const holds = merge(R.DEF.hold, res[2], res[3]);
     let fab = new Map(), fabError = "";
-    try {
-      try { await state.client.ensureDefinition(state.lib.id, F.definition()); } catch (e) { if (e.status !== 403) throw e; }
-      fab = await readBoth(F.DEF_ID);
-    } catch (e) {
-      if (e.status !== 404) { fabError = errText(e); console.warn("fabrication dates not available", e); }
-    }
-    const dels = await state.client.listAll(state.lib.id, R.DEF.delivery, R.deliveryPrefix(state.project.id));
+    if (fabFail) {
+      if (fabFail.status !== 404) { fabError = errText(fabFail); console.warn("fabrication dates not available", fabFail); }
+    } else fab = merge(F.DEF_ID, res[4], res[5]);
     if (!current()) return false;
     state.status = status; state.holds = holds; state.fab = fab; state.fabError = fabError; state.legacyOnly = legacyOnly;
     state.deliveries = [...dels].map(([link, p]) => Object.assign({ link }, p)).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    book.replay(state, since);   // a write that finished during this load stays on screen (M3)
     return true;
   }
 
@@ -386,13 +507,18 @@
     for (const o of objs) for (const id of (o.parts && o.parts.length ? o.parts : [o.id])) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(id); }
     return { modelObjectIds: [...byModel].map(([modelId, objectRuntimeIds]) => ({ modelId, objectRuntimeIds })) };
   };
+  // Colours need the parts (phase B): asked earlier, they are painted when the parts are in (settle).
+  let colourDeferred = false;
   async function applyColours() {
     if (!state.asms.length) return;
+    if (!state.partsReady) { colourDeferred = true; return; }
+    colourDeferred = false;
     if (!state.coloured) return state.api.viewer.setObjectState(sel(state.asms), { color: "reset", opacity: 1 });
+    // one setObjectState call per colour group (week 3, A7); colours and opacity from steel.js STATES
     const st = avail().state;
     for (const s of L.STATES) {
       const list = state.asms.filter((a) => st.get(a.guid) === s.id);
-      if (list.length) await state.api.viewer.setObjectState(sel(list), { color: s.colour, opacity: s.id === "notDelivered" ? 0.35 : 1 });
+      if (list.length) await state.api.viewer.setObjectState(sel(list), { color: s.colour, opacity: s.opacity == null ? 1 : s.opacity });
     }
   }
 
@@ -467,7 +593,7 @@
   const flagArmed = (kind, on, n) => !!state.flagArmed && state.flagArmed.key === `${kind}:${on ? 1 : 0}:${n}` && Date.now() - state.flagArmed.at < 10000;
   async function applyFlag(kind, on) {
     if (!state.lib) return flash(L2("Няма библиотека STEEL/Монтаж.", "No library STEEL/Монтаж."), true);
-    if (!can(kind === "hold" ? "hold" : "status")) return flash(t("noRight"), true);
+    if (!can(kind === "hold" ? "hold" : "status")) return flash(noRight(), true);
     const { list: targets, correcting } = flagTargets(kind, on);
     if (!targets.length) return;
     if (targets.length > BIG && !flagArmed(kind, on, targets.length)) {
@@ -481,12 +607,12 @@
     // a correction with an empty box keeps each piece's own value (round 8 M1); a new mark needs the note as before
     if (on && kind !== "erected" && !note && !correcting) return flash(L2("Въведете бележка / причина.", "Enter a note / reason."), true);
     if (on && date > R.today()) return flash(L2("Датата е в бъдещето.", "The date is in the future."), true);
-    const def = kind === "hold" ? R.DEF.hold : R.DEF.status, store = kind === "hold" ? state.holds : state.status;
+    const def = kind === "hold" ? R.DEF.hold : R.DEF.status, field = kind === "hold" ? "holds" : "status";
     // more than BIG pieces (the confirmed path): undo file first
     const bak = targets.length > BIG ? await backupFirst(`${kind}-${on ? (correcting ? "correct" : "set") : "undo"}`, linksOf(def, targets.map((a) => a.guid))) : "";
     let done = 0, failed = 0, first = "";
     await pool(targets, 6, async (a) => {
-      const cur = store.get(a.guid) || null;
+      const cur = state[field].get(a.guid) || null;
       if (!on && !(cur && cur[kind])) return;
       let info = { date, note, by: state.user, mark: a.mark };
       if (correcting && cur) {
@@ -500,13 +626,13 @@
           // undo over a raw-"$" copy (review 9 M1): full record to the encoded link, raw copy deleted, then the replace
           await R.replaceOverRaw(state.client, state.lib.id, def, entLink(a.guid), legacyLink(a.guid), next);
           state.legacyOnly = state.legacyOnly.filter((r) => !(r.def === def && r.guid === a.guid));
-          store.set(a.guid, next); done++;
+          keepRec(field, a.guid, next); done++;
         } else {
           await (on ? state.client.write : state.client.replace).call(state.client, state.lib.id, def, entLink(a.guid), next);
-          store.set(a.guid, next); done++;
+          keepRec(field, a.guid, next); done++;
           await dropLegacy(def, a.guid);
         }
-      } catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
+      } catch (e) { failed++; if (!first) first = e.status === 403 ? noRight() : errText(e); }
     });
     if (done && !failed) delete state.drafts[kind];
     const skipped = on ? state.sel.length - targets.length : 0;
@@ -519,13 +645,14 @@
 
   async function addDelivery(lines, source) {
     if (!state.lib) return setStatus(L2("Няма библиотека STEEL/Монтаж.", "No library STEEL/Монтаж."), true);
-    if (!can("status")) return setStatus(t("noRight"), true);
+    if (!can("status")) return setStatus(noRight(), true);
     if (!lines.length) return setStatus(L2("Няма редове с марка и количество.", "No lines with mark and quantity."), true);
     const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     const rec = R.newDelivery({ date: $("dlvDate").value || R.today(), noteNo: $("dlvNo").value.trim(), lines: L.linesText(lines), by: state.user, source });
     const link = R.deliveryLink(state.project.id, id);
     await state.client.write(state.lib.id, R.DEF.delivery, link, rec);
-    state.deliveries.unshift(Object.assign({ link }, rec));
+    const shown = Object.assign({ link }, rec);
+    state.deliveries.unshift(shown); book.add("deliveries", link, shown);
     const known = new Set(state.asms.map((a) => L.normMark(a.mark)));
     const unknown = lines.filter((l) => !known.has(l.mark)).map((l) => l.mark);
     flash(L2(`Доставката е записана (${lines.length} марки)`, `Delivery saved (${lines.length} marks)`) + (unknown.length ? ` · ${L2("няма в модела", "not in the model")}: ${unknown.join(", ")}` : ""), unknown.length > 0);
@@ -534,7 +661,7 @@
     if (state.coloured) await applyColours();
   }
   async function cancelDelivery(i) {
-    if (!can("status")) return setStatus(t("noRight"), true);
+    if (!can("status")) return setStatus(noRight(), true);
     const d = state.deliveries[i];
     // inline reason box in the row (window.prompt is unreliable inside the Connect iframe)
     if (state.cancelling !== i) { state.cancelling = i; render(); const r = $("dlvReason"); if (r) r.focus(); return; }
@@ -544,7 +671,9 @@
     const next = R.cancelDelivery(d, { by: state.user, note: reason });
     const { link, ...props } = next;
     await state.client.write(state.lib.id, R.DEF.delivery, d.link, props);
-    state.deliveries[i] = next;
+    const j = state.deliveries.findIndex((x) => x.link === d.link);   // the live list (a load may have replaced it)
+    if (j >= 0) state.deliveries[j] = next; else state.deliveries.unshift(next);
+    book.add("deliveries", d.link, next);
     render();
     if (state.coloured) await applyColours();
   }
@@ -629,7 +758,9 @@
     return { sheets: [{ name: "", rows }], date1904: false };
   }
 
-  async function importFab(file) {
+  /** file: a picked File, or {name, arrayBuffer()} downloaded from Connect; ref: {id, versionId, path} of a Connect
+   *  file (B-Office 1), recorded in each history line so the file list can mark it "внесен". */
+  async function importFab(file, ref) {
     state.fabClearArmed = 0;
     state.fabPlan = null;
     const wb = await readWorkbook(file);
@@ -645,7 +776,7 @@
         : L2("Няма колона GUID – това не е файл от отчета AM_Fabrication.", "No GUID column – this is not a file from the AM_Fabrication report."), true);
     }
     const known = new Map(state.asms.map((a) => [a.guid, { mark: a.mark }]));
-    state.fabPlan = { source: file.name, p: F.plan(rows, { toIfc: L.tcGuidToIfc, known, existing: state.fab, date1904: wb.date1904 }) };
+    state.fabPlan = { source: file.name, ref: ref || null, p: F.plan(rows, { toIfc: L.tcGuidToIfc, known, existing: state.fab, date1904: wb.date1904 }) };
     state.tab = "fab";
     setStatus(L2(`Прочетен ${file.name}: проверете промените и натиснете „Запиши“.`, `Read ${file.name}: check the changes and press "Save".`)
       + (skipped.length ? L2(` Пропуснати листове (без GUID / дати): `, ` Sheets skipped (no GUID / dates): `) + skipped.join(", ") : ""), skipped.length > 0);   // round 5, L5
@@ -691,7 +822,7 @@
           await state.client.remove(state.lib.id, r.def, legacyLink(r.guid));
         }
         done++;
-      } catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
+      } catch (e) { failed++; if (!first) first = e.status === 403 ? noRight() : errText(e); }
     });
     await loadRecords();
     flash(L2(`Преместени ${done} записа.`, `Moved ${done} records.`) + (skipped ? ` · ${skipped} ${L2("без права", "no right")}` : "")
@@ -710,11 +841,12 @@
     const h = n.toString(16).padStart(32, "0");
     return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
   }
-  const isAdmin = () => !!(window.ARSTEN_DEMO || (state.access && state.access.role === "admin"));
+  // "Изчисти" the fabrication dates: admins with write access only (M3)
+  const isAdmin = () => !!(window.ARSTEN_DEMO || (ArstenAccess.hasRole(state.access, "admin") && ArstenAccess.canWrite(state.access)));
   // the confirm click must follow within 10 s (round 6 L5)
   const clearArmed = () => !!state.fabClearArmed && Date.now() - state.fabClearArmed < 10000;
   async function clearFab() {
-    if (!state.lib || !isAdmin()) return setStatus(t("noRight"), true);
+    if (!state.lib || !isAdmin()) return setStatus(noRight(), true);
     if (!clearArmed()) { state.fabClearArmed = Date.now(); render(); setTimeout(render, 10500); return; }   // second click confirms
     state.fabClearArmed = 0;
     const list = state.sel.slice();
@@ -733,8 +865,8 @@
     await pool(list, 6, async (a) => {
       // other forms first, the encoded (visible) one last: a failure never leaves an old copy behind it (round 6 L1)
       const links = [...found.get(a.guid)].filter((l) => l !== entLink(a.guid)).concat(entLink(a.guid));
-      try { for (const l of links) await state.client.remove(state.lib.id, F.DEF_ID, l); state.fab.delete(a.guid); done++; }
-      catch (e) { failed++; if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
+      try { for (const l of links) await state.client.remove(state.lib.id, F.DEF_ID, l); keepRec("fab", a.guid, null); done++; }
+      catch (e) { failed++; if (!first) first = e.status === 403 ? noRight() : errText(e); }
     });
     await loadRecords();
     flash(L2(`Изтрити дати: ${done} сглобки.`, `Dates cleared: ${done} assemblies.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
@@ -748,7 +880,7 @@
     const fp = state.fabPlan;
     if (!fp) return;
     if (!state.lib) return setStatus(L2("Няма библиотека STEEL/Монтаж.", "No library STEEL/Монтаж."), true);
-    if (!can("fab")) return setStatus(t("noRight"), true);
+    if (!can("fab")) return setStatus(noRight(), true);
     // Each assembly is read fresh and written with its version: only the changed fields go out (never a stale copy of
     // the others), and an assembly someone else changed since the preview is skipped, not overwritten (round 5, M2/L4)
     const bak = await backupFirst("fab-import", linksOf(F.DEF_ID, fp.p.changes.map((c) => c.ifc)));
@@ -768,16 +900,17 @@
             if (old && old.props) { fresh = Object.assign({}, fresh, old.props, { log: [fresh.log, old.props.log].filter(Boolean).join("\n") }); moved = true; }
           }
           fresh = fresh || {};
-          if (F.changedSince(c, c.before, fresh).length) { meanwhile.push(c.mark || c.ifc); state.fab.set(c.ifc, fresh); return; }
-          const patch = Object.assign(moved ? Object.assign({}, fresh) : {}, F.patchFor(fresh, c, { source: fp.source, by: state.user }));
+          if (F.changedSince(c, c.before, fresh).length) { meanwhile.push(c.mark || c.ifc); keepRec("fab", c.ifc, fresh); return; }
+          // from Connect: "(file, Name, file:<id> v:<version>)" in the history line (steel.js parseFabLog)
+          const patch = Object.assign(moved ? Object.assign({}, fresh) : {}, F.patchFor(fresh, c, { source: fp.source, by: [state.user, L.fileTag(fp.ref)].filter(Boolean).join(", ") }));
           try { await state.client.writeIfUnchanged(state.lib.id, F.DEF_ID, link, patch, cur ? cur.v : undefined); }
           catch (e) { if ((e.status === 412 || e.status === 409) && attempt < 3) continue; throw e; }
-          state.fab.set(c.ifc, Object.assign({}, fresh, patch));
+          keepRec("fab", c.ifc, Object.assign({}, fresh, patch));
           if (moved) await dropLegacy(F.DEF_ID, c.ifc);
           done++;
           return;
         }
-      } catch (e) { failedList.push(c); if (!first) first = e.status === 403 ? t("noRight") : errText(e); }
+      } catch (e) { failedList.push(c); if (!first) first = e.status === 403 ? noRight() : errText(e); }
       finally { const n = done + failedList.length + meanwhile.length; if (n % 25 === 0) setStatus(L2(`Записвам… ${n} от ${fp.p.changes.length}`, `Saving… ${n} of ${fp.p.changes.length}`)); }
     });
     // only what failed stays in the preview, so "Save" again does not rewrite (and re-log) what is already saved (L3)
@@ -794,16 +927,111 @@
     if (state.coloured) await applyColours();   // DelivDate counts as delivered (owner's rule 16.11.2026)
   }
 
+  // ---------- the fabricator's files in Connect (week 3, B-Office 1) ----------
+  // Read only: lists _ArstenDocs/Fabrication and its subfolders (Core 2.0, the same client as the undo files), never
+  // creates a folder. "Внеси" downloads the file (files/fs/{id}/downloadurl) and runs the same preview as a picked file;
+  // the import keeps its preview, "Запиши" and undo file.
+  const FAB_FOLDER = ["_ArstenDocs", "Fabrication"];
+  const itemsOf = (it) => (Array.isArray(it) ? it : (it && it.items) || []);
+  const isFolder = (x) => String((x && x.type) || "").toUpperCase() === "FOLDER";
+  async function listFabFiles() {
+    const core = coreFor();
+    const p = await core.req(`projects/${encodeURIComponent(state.project.id)}`);
+    let id = p && p.rootId;
+    if (!id) throw new Error(L2("основната папка на проекта не е намерена", "project root folder not found"));
+    for (const name of FAB_FOLDER) {
+      const f = itemsOf(await core.req(`folders/${encodeURIComponent(id)}/items`)).find((x) => isFolder(x) && String(x.name).toLowerCase() === name.toLowerCase());
+      if (!f) return { missing: true, files: [] };
+      id = f.id;
+    }
+    const entries = [];
+    const walk = async (fid, path, depth) => {
+      for (const x of itemsOf(await core.req(`folders/${encodeURIComponent(fid)}/items`))) {
+        if (isFolder(x)) { if (depth < 4 && entries.length < 500) await walk(x.id, path ? `${path}/${x.name}` : x.name, depth + 1); }
+        else entries.push({ item: x, path });
+      }
+    };
+    await walk(id, "", 0);
+    return { missing: false, files: L.fabFiles(entries) };
+  }
+  async function refreshFabFiles() {
+    const ff = state.fabFiles;
+    if (ff.loading) return;
+    ff.loading = true; ff.error = "";
+    try { const r = await listFabFiles(); ff.list = r.files; ff.missing = r.missing; }
+    catch (e) { ff.list = []; ff.error = e.status === 403 ? L2("нямате достъп до папката", "no access to the folder") : errText(e); console.warn("fabricator files", e); }
+    finally { ff.loading = false; ff.at = Date.now(); }
+    if (state.tab === "fab") render();
+  }
+  async function importFromConnect(fileId) {
+    const ff = state.fabFiles, f = ff.list.find((x) => x.id === fileId);
+    if (!f || ff.busy) return;
+    if (!can("fab")) return flash(noRight(), true);
+    ff.busy = f.id; render();
+    try {
+      setStatus(L2(`Изтеглям ${f.name}…`, `Downloading ${f.name}…`));
+      // exactly the version shown in the list, which is also the version recorded in the history (review 10 L4)
+      const d = await coreFor().req(`files/fs/${encodeURIComponent(f.id)}/downloadurl${f.versionId ? `?versionId=${encodeURIComponent(f.versionId)}` : ""}`);
+      const url = d && (d.url || d.downloadUrl || d.href);
+      if (!url) throw new Error(L2("Connect не върна адрес за изтегляне", "Connect returned no download address"));
+      let buf;
+      try { const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 120000); try { const res = await fetch(url, { signal: ctl.signal }); if (!res.ok) throw new Error(`HTTP ${res.status}`); buf = await res.arrayBuffer(); } finally { clearTimeout(t); } }   // 2 min limit (round 12 M1)
+      catch (e) { throw new Error(L2(`файлът не може да се изтегли в панела (${errText(e)}). Изтеглете го от Connect и го изберете с „Импорт Excel от производителя“.`,
+        `the file cannot be downloaded into the panel (${errText(e)}). Download it from Connect and pick it with "Import the fabricator's Excel".`)); }
+      await importFab({ name: f.name, arrayBuffer: async () => buf }, { id: f.id, versionId: f.versionId, path: f.path });
+    } finally { ff.busy = null; render(); }
+  }
+  const fmtStamp = (s) => { if (!s) return ""; const m = /^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d)/.exec(String(s)); if (!m) return fmtDate(String(s).slice(0, 10));
+    const d = new Date(s); if (/T/.test(s) && !isNaN(d)) return `${fmtDate(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    return `${fmtDate(m[1])} ${m[2]}`; };
+  /** A13: stays after a fabrication import, read from the newest fabstatus record (its Source and history line). */
+  function lastImportBox() {
+    const li = L.lastImport(state.fab);
+    if (!li) return "";
+    return `<div class="keep">${esc(L2("Последен импорт", "Last import"))}: <b>${esc(li.source || "?")}</b>${li.by ? `, ${esc(li.by)}` : ""}, ${esc(fmtStamp(li.when))}${li.assemblies ? ` <span class="sub">(${li.assemblies} ${esc(L2("сглобки", "assemblies"))})</span>` : ""}
+      – <b>${esc(L2("синхронизирайте Tekla преди нов отчет", "synchronize Tekla before a new report"))}</b> <span class="sub">(Trimble Connect → Property sets → Synchronize)</span></div>`;
+  }
+  function fabFilesBox(right) {
+    const ff = state.fabFiles;
+    if (!ff.at && !ff.loading && state.tab === "fab") setTimeout(() => guarded(refreshFabFiles), 0);   // first time the tab is shown
+    const refs = L.importRefs(state.fab);
+    const badge = (s) => (s === "imported" ? `<span class="badge done">${esc(L2("внесен", "imported"))}</span>`
+      : s === "maybe" ? `<span class="badge maybe" title="${esc(L2("Внесен е файл със същото име, но без запис коя версия – проверете", "A file with this name was imported, but which version is not recorded – check"))}">${esc(L2("внесен?", "imported?"))}</span>`
+      : s === "newVersion" ? `<span class="badge new">${esc(L2("нова версия", "new version"))}</span>` : `<span class="badge new">${esc(L2("нов", "new"))}</span>`);
+    const rows = ff.list.map((f) => {
+      const s = L.fileState(f, refs);
+      return `<tr><td><b>${esc(f.name)}</b>${f.path ? `<div class="sub">${esc(f.path)}</div>` : ""}</td><td class="sub">${esc(fmtStamp(f.modified))}${f.by ? `<div>${esc(f.by)}</div>` : ""}</td><td>${badge(s)}</td>
+        <td class="n"><button class="small${s === "imported" ? " secondary" : ""}" data-act="fabFromConnect" data-id="${esc(f.id)}" ${right && !ff.busy && !state.fabPlan ? "" : "disabled"}>${esc(ff.busy === f.id ? L2("Чета…", "Reading…") : s === "imported" ? L2("Внеси пак", "Import again") : L2("Внеси", "Import"))}</button></td></tr>`;
+    }).join("");
+    const body = ff.loading || !ff.at ? `<div class="sub">${esc(L2("Чета папката…", "Reading the folder…"))}</div>`
+      : ff.error ? `<div class="warn">${esc(L2("Папката не може да се прочете: ", "The folder cannot be read: ") + ff.error)}</div>`
+      : ff.missing ? `<div class="sub">${esc(L2("Папката _ArstenDocs/Fabrication още не съществува в проекта.", "The folder _ArstenDocs/Fabrication does not exist in the project yet."))}</div>`
+      : !ff.list.length ? `<div class="sub">${esc(L2("Няма файлове .xlsx / .xls в папката.", "No .xlsx / .xls files in the folder."))}</div>`
+      : `<div class="scroll"><table><thead><tr><th>${esc(L2("Файл", "File"))}</th><th>${esc(L2("Качен", "Uploaded"))}</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    return `<div class="box" style="margin-top:6px"><div class="bar" style="margin-top:0"><b>${esc(L2("Файлове от производителя", "Files from the fabricator"))}</b>
+      <span class="sub">_ArstenDocs/Fabrication</span><button class="small secondary" data-act="fabFilesRefresh" style="margin-left:auto" ${ff.loading ? "disabled" : ""}>${esc(L2("Обнови", "Refresh"))}</button></div>${body}
+      ${state.fabPlan && ff.list.length ? `<div class="sub">${esc(L2("Първо запишете или откажете прегледания импорт.", "First save or cancel the import being previewed."))}</div>` : ""}</div>`;
+  }
+
   // ---------- rendering ----------
+  let lastAv = null, filterTimer = 0;   // figures of the last render, for the mark search (L3)
   function render() {
     $("title").textContent = t("title");
     $("hSel").textContent = t("selection"); $("lblFollow").textContent = t("follow"); $("btnSelClear").textContent = t("clear");
     $("hView").textContent = t("view"); $("lblColour").textContent = t("colour");
-    document.querySelectorAll("#tabs button").forEach((b) => { b.textContent = t(b.dataset.tab); b.classList.toggle("on", b.dataset.tab === state.tab); });
+    $("chkColour").checked = state.coloured; $("chkFollow").checked = state.follow;
+    // Производство: office side and admin only (week 3, A8)
+    const off = office();
+    if (state.tab === "fab" && !off) state.tab = "marks";
+    document.querySelectorAll("#tabs button").forEach((b) => { b.textContent = t(b.dataset.tab); b.classList.toggle("on", b.dataset.tab === state.tab); b.hidden = b.dataset.tab === "fab" && !off; });
     ["marks", "deliveries", "fab", "bolts", "docs"].forEach((k) => { $("tab-" + k).hidden = state.tab !== k; });
-    $("legend").innerHTML = L.STATES.map((s) => `<span><span class="sw" style="background:${s.colour}"></span>${esc(lang === "bg" ? s.bg : s.en)}</span>`).join("");
+    const av = state.ready ? avail() : null;
+    lastAv = av;
+    const counts = new Map();
+    if (av) for (const s of av.state.values()) counts.set(s, (counts.get(s) || 0) + 1);
+    $("legend").innerHTML = L.STATES.map((s) => `<span class="li"><span class="sw" style="background:${s.colour};opacity:${s.opacity == null ? 1 : Math.max(s.opacity, 0.6)}"></span>${esc(lang === "bg" ? s.bg : s.en)}${av ? ` <span class="cnt">${counts.get(s.id) || 0}</span>` : ""}</span>`).join("");
+    $("legend").classList.toggle("off", !state.coloured);
     if (!state.ready) return;
-    const av = avail();
     // selection
     const sel = state.sel;
     if (!sel.length) $("selText").innerHTML = `<span class="sub">${esc(t("nothing"))}</span>`;
@@ -845,12 +1073,20 @@
         : sel.length && on.list.length < sel.length ? `<div class="sub">${esc(L2(`${sel.length - on.list.length} вече отбелязани остават както са.`, `${sel.length - on.list.length} already marked stay as they are.`))}</div>` : ""}
       <div class="row"><button class="small" data-act="on" data-kind="${kind}" ${on.list.length && right ? "" : "disabled"}>${esc(onLbl)}</button>
         <button class="small secondary undo" data-act="off" data-kind="${kind}" ${off.list.length && right ? "" : "disabled"}>${esc(offLbl)}</button>
-        ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div></div>`;
+        ${right ? "" : `<span class="sub">${esc(noRight())}</span>`}</div></div>`;
     };
-    $("acts").innerHTML = act("erected", "#2E7D32", state.status, can("status"), false, t("note"))
-      + act("wrong", "#C62828", state.status, can("status"), true, t("note"))
-      + act("hold", "#7B1FA2", state.holds, can("hold"), true, t("reason"));
-    renderMarks(av); renderDeliveries(av); renderFab(); renderBolts(); renderDocs(av);
+    const colourOf = (id) => (L.STATES.find((s) => s.id === id) || {}).colour;
+    $("acts").innerHTML = act("erected", colourOf("erected"), state.status, can("status"), false, t("note"))
+      + act("wrong", colourOf("wrong"), state.status, can("status"), true, t("note"))
+      + act("hold", colourOf("hold"), state.holds, can("hold"), true, t("reason"));
+    // only the tab that is shown (speed audit item 15): every tab switch calls render(), so a hidden tab is drawn when
+    // it is opened; until then it keeps its last content, hidden
+    if (!off) $("tab-fab").innerHTML = "";
+    if (state.tab === "marks") renderMarks(av);
+    else if (state.tab === "deliveries") renderDeliveries(av);
+    else if (state.tab === "fab") renderFab();
+    else if (state.tab === "bolts") renderBolts();
+    else if (state.tab === "docs") renderDocs(av);
     const bl = $("build"); if (bl) bl.textContent = `Стомана v${BUILD}`;
   }
 
@@ -876,37 +1112,52 @@
         ${list(L2("Не са в заредения модел (не се записват)", "Not in the loaded model (not saved)"), p.notLoaded)}
         ${list(L2("Невалиден GUID", "Invalid GUID"), p.badGuid)}
         <div class="bar"><button class="small" data-act="fabApply" ${p.changes.length && right ? "" : "disabled"}>${esc(L2(`Запиши (${p.changes.length} сглобки)`, `Save (${p.changes.length} assemblies)`))}</button>
-          <button class="small secondary" data-act="fabCancel">${esc(L2("Откажи", "Cancel"))}</button>${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div></div>`;
+          <button class="small secondary" data-act="fabCancel">${esc(L2("Откажи", "Cancel"))}</button>${right ? "" : `<span class="sub">${esc(noRight())}</span>`}</div></div>`;
     }
     $("tab-fab").innerHTML = (state.fabError ? `<div class="warn">${esc(L2("Датите за производство не могат да се прочетат: ", "Fabrication dates cannot be read: ") + state.fabError)}</div>` : "") + `<div class="box">
         <div>${L2("Изработени", "Fabricated")}: <b>${fabN}</b> · ${L2("Доставени", "Delivered")}: <b>${delN}</b> / ${total}</div>
         <div class="bar"><label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel от производителя", "Import the fabricator's Excel")}<input type="file" id="fabFile" accept=".xlsx,.xls,.htm,.html" hidden></label>
-          ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div>
-        ${legacyBanner()}${noBackupBox()}
+          ${right ? "" : `<span class="sub">${esc(noRight())}</span>`}</div>
+        ${legacyBanner()}${noBackupBox()}${lastImportBox()}
         ${isAdmin() && state.sel.length ? `<div class="bar"><button class="small secondary" data-act="clearFab">${esc(clearArmed()
           ? L2(`Потвърди: изтрий датите на ${state.sel.length} сглобки`, `Confirm: clear the dates of ${state.sel.length} assemblies`)
           : L2(`Изтрий датите на избраните (${state.sel.length})`, `Clear the dates of the selected (${state.sel.length})`))}</button></div>` : ""}
         <div class="sub">${esc(L2("Файлът от отчета AM_Fabrication с попълнени оранжеви колони. Сглобките се разпознават по GUID. Празна клетка не изтрива дата. Tekla чете датите като ASSEMBLY.PSET.AM_Fabrication.* след „Synchronize property sets“.",
-          "The AM_Fabrication report file with the orange columns filled. Assemblies are matched by GUID. An empty cell never clears a date. Tekla reads the dates as ASSEMBLY.PSET.AM_Fabrication.* after \"Synchronize property sets\"."))}</div></div>${preview}`;
+          "The AM_Fabrication report file with the orange columns filled. Assemblies are matched by GUID. An empty cell never clears a date. Tekla reads the dates as ASSEMBLY.PSET.AM_Fabrication.* after \"Synchronize property sets\"."))}</div></div>${preview}${fabFilesBox(right)}`;
     const f = $("fabFile");
     if (f) f.onchange = (e) => guarded(async () => { const file = e.target.files[0]; e.target.value = ""; if (file) await importFab(file); });
   }
 
   function legacyBanner() {
     const n = (state.legacyOnly || []).length;
-    if (!n) return "";
+    if (!n || !office()) return "";   // an admin migration task: not shown to site roles (week 3, A8)
     const any = ["status", "hold", "fab"].some((w) => can(w));
     return `<div class="warn">${esc(L2(`${n} записа (сглобки с „$“ в GUID) са в стар формат и не се виждат в панела на Connect и в Tekla.`, `${n} records (assemblies with "$" in the GUID) are in the old format and are not shown in Connect's panel or Tekla.`))}
       <div class="bar"><button class="small" data-act="moveLegacy" ${any ? "" : "disabled"}>${esc(L2("Премести", "Move"))}</button></div></div>`;
   }
   function renderMarks(av) {
     const over = av.marks.filter((m) => m.over);
-    $("tab-marks").innerHTML = legacyBanner() + noBackupBox() + differsWarn(av) + (over.length ? `<div class="warn">${esc(L2("Монтирани повече от доставените: ", "Erected more than delivered: "))}${esc(over.map((m) => `${m.mark} (${m.erected}/${m.delivered})`).join(", "))}</div>` : "")
+    const ae = document.activeElement, focused = !!ae && ae.id === "markFilter", pos = focused ? ae.selectionStart : null;
+    const html = legacyBanner() + noBackupBox() + differsWarn(av) + (over.length ? `<div class="warn">${esc(L2("Монтирани повече от доставените: ", "Erected more than delivered: "))}${esc(over.map((m) => `${m.mark} (${m.erected}/${m.delivered})`).join(", "))}</div>` : "")
       + (av.unknownDeliveredMarks.length ? `<div class="warn">${esc(L2("Доставени марки, които ги няма в модела: ", "Delivered marks not in the model: "))}${esc(av.unknownDeliveredMarks.join(", "))}</div>` : "")
-      + `<div class="scroll"><table><thead><tr><th>${L2("Марка", "Mark")}</th><th class="n">${L2("Бр.", "Qty")}</th><th class="n">${L2("Дост.", "Deliv.")}</th><th class="n">${L2("Монт.", "Erect.")}</th><th class="n" title="${esc(L2("доставени − монтирани", "delivered − erected"))}">${L2("Налични", "Available")}</th><th class="n">${L2("Не дост.", "Not del.")}</th></tr></thead><tbody>`
-      + av.marks.map((m, i) => `<tr><td class="name"><button class="small secondary" data-act="pickMark" data-mark="${esc(m.mark)}" title="${esc(L2("Избери в модела", "Select in the model"))}">${esc(m.mark || "?")}</button>${m.hold ? ` <span class="sub">${L2("задърж.", "hold")} ${m.hold}</span>` : ""}${m.wrong ? ` <span class="bad sub">${L2("грешни", "wrong")} ${m.wrong}</span>` : ""}</td>
-        <td class="n">${m.instances}</td><td class="n" title="${esc(m.source ? `${srcName(m.source)} · ${srcFigures(m)}` : "")}">${m.delivered}${m.source ? `<div class="sub${m.differs ? " bad" : ""}">${esc(m.differs ? srcFigures(m) : srcName(m.source))}</div>` : ""}</td><td class="n${m.over ? " bad" : ""}">${m.erected}</td><td class="n">${m.available}</td><td class="n">${m.notDelivered}</td></tr>`).join("")
-      + `</tbody></table></div>`;
+      // search box (week 3, A5): filters the rows below without re-rendering itself, so typing keeps the focus
+      + `<div class="search"><input type="search" id="markFilter" value="${esc(state.markFilter)}" placeholder="${esc(L2("Търси марка: RF, RF22, 22…", "Find a mark: RF, RF22, 22…"))}" autocomplete="off" enterkeyhint="search"><span id="markCount" class="sub"></span></div>`
+      + `<div class="scroll"><table><thead><tr><th>${L2("Марка", "Mark")}</th><th class="n">${L2("Бр.", "Qty")}</th><th class="n">${L2("Дост.", "Deliv.")}</th><th class="n">${L2("Монт.", "Erect.")}</th><th class="n" title="${esc(L2("доставени − монтирани", "delivered − erected"))}">${L2("Налични", "Available")}</th><th class="n">${L2("Не дост.", "Not del.")}</th></tr></thead><tbody id="markRows"></tbody></table></div>`;
+    // a selection click changes nothing in this tab: the same HTML is not parsed again, so the table, its scroll
+    // position and the search box (focus, caret; A5) stay as they are (speed audit item 15)
+    const box = $("tab-marks");
+    if (box._html !== html || !$("markRows")) { box.innerHTML = html; box._html = html; }
+    fillMarkRows(av);
+    if (focused && document.activeElement !== $("markFilter")) { const el = $("markFilter"); el.focus(); try { el.setSelectionRange(pos, pos); } catch {} }
+  }
+  const shownMarks = (av) => av.marks.filter((m) => L.matchMark(m.mark, state.markFilter));
+  function fillMarkRows(av) {
+    const shown = shownMarks(av);
+    $("markCount").textContent = state.markFilter.trim() ? `${shown.length} / ${av.marks.length}` : "";
+    const rows = $("markRows"), html = (shown.length ? "" : `<tr><td colspan="6" class="sub">${esc(L2("Няма такава марка.", "No such mark."))}</td></tr>`)
+      + shown.map((m) => `<tr><td class="name"><button class="small secondary" data-act="pickMark" data-mark="${esc(m.mark)}" title="${esc(L2("Избери в модела", "Select in the model"))}">${esc(m.mark || "?")}</button>${m.hold ? ` <span class="sub">${L2("задърж.", "hold")} ${m.hold}</span>` : ""}${m.wrong ? ` <span class="bad sub">${L2("грешни", "wrong")} ${m.wrong}</span>` : ""}</td>
+        <td class="n">${m.instances}</td><td class="n" title="${esc(m.source ? `${srcName(m.source)} · ${srcFigures(m)}` : "")}">${m.delivered}${m.source ? `<div class="sub${m.differs ? " bad" : ""}">${esc(m.differs ? srcFigures(m) : srcName(m.source))}</div>` : ""}</td><td class="n${m.over ? " bad" : ""}">${m.erected}</td><td class="n">${m.available}</td><td class="n">${m.notDelivered}</td></tr>`).join("");
+    if (rows._html !== html) { rows.innerHTML = html; rows._html = html; }
   }
 
   function renderDeliveries(av) {
@@ -927,7 +1178,7 @@
         <textarea id="dlvText" placeholder="${esc(L2("Марка и брой на ред, напр.\nRF22 3\nCL22 2", "Mark and qty per line, e.g.\nRF22 3\nCL22 2"))}">${esc(dd.dlvText || "")}</textarea>
         <div class="bar"><button class="small" data-act="dlvAdd" ${right ? "" : "disabled"}>${L2("Запиши доставка", "Save delivery")}</button>
           <label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel/CSV", "Import Excel/CSV")}<input type="file" id="dlvFile" accept=".xlsx,.csv,.txt" hidden></label>
-          ${right ? "" : `<span class="sub">${esc(t("noRight"))}</span>`}</div>
+          ${right ? "" : `<span class="sub">${esc(noRight())}</span>`}</div>
         <div class="sub">${esc(L2("Файл: колона A марка, колона B брой (редовете със заглавия се пропускат).", "File: column A mark, column B qty (header rows are skipped)."))}</div></div>
       <div class="scroll" style="margin-top:6px"><table><thead><tr><th>${L2("Дата", "Date")}</th><th>№</th><th>${L2("Марки", "Marks")}</th><th></th></tr></thead><tbody>`
       + (state.deliveries.length ? state.deliveries.map((d, i) => `<tr${d.cancelled ? ' style="opacity:.5"' : ""}><td>${esc(fmtDate(d.date))}</td><td>${esc(d.note_no || "")}</td>
@@ -947,6 +1198,7 @@
     return state.bolts.filter((b) => g.has(b.ownGuid) || ((b.sides && b.sides.others) || []).some((x) => g.has(x)));
   }
   function renderBolts() {
+    if (!state.partsReady) { $("tab-bolts").innerHTML = `<div class="sub">${esc(state.partsError ? L2("Частите не са прочетени: ", "The parts could not be read: ") + state.partsError : partsText())}</div>`; return; }
     const list = L.boltList(boltScope(), erectedFn());
     const cnt = (k, label) => `<span>${esc(label)} <span class="cnt">${list[k].length}</span></span>`;
     $("tab-bolts").innerHTML = (state.hasLinks ? "" : `<div class="warn">${esc(L2("Непълен списък: експортът няма Connected_Assemblies / Main_Part_GUID. Болтовете са само по собствената си сглобка.", "Partial list: the export has no Connected_Assemblies / Main_Part_GUID. Bolts are listed by their own assembly only."))}</div>`)
@@ -967,7 +1219,10 @@
     $("tab-docs").innerHTML = `<div class="box"><div>${L2("Монтирани", "Erected")}: <b>${erected}</b> / ${state.asms.length}</div>
       <div class="bar"><button class="small" data-act="docErected">${L2("Монтирани сглобки (Excel)", "Erected assemblies (Excel)")}</button>
       <button class="small secondary" data-act="docMarks">${L2("По марки (Excel)", "By mark (Excel)")}</button>
-      <button class="small secondary" data-act="docDeliveries">${L2("Доставки (Excel)", "Deliveries (Excel)")}</button></div></div>`;
+      <button class="small secondary" data-act="docInstances">${L2("Статус по сглобки (Excel)", "Status per assembly (Excel)")}</button>
+      <button class="small secondary" data-act="docDeliveries">${L2("Доставки (Excel)", "Deliveries (Excel)")}</button></div>
+      <div class="sub">${esc(L2("„По марки“ и „Статус по сглобки“ съдържат датите за производство, теглата и % по тегло.", "\"By mark\" and \"Status per assembly\" include the fabrication dates, the weights and the % by weight."))}</div></div>
+      ${office() ? lastImportBox() : ""}`;
   }
 
   // ---------- exports ----------
@@ -979,6 +1234,9 @@
       const ws = wb.addWorksheet(sh.name);
       for (const r of sh.rows) { const row = ws.addRow(r.values); if (r.bold) row.font = { bold: true }; if (r.fill) row.eachCell((c) => { c.fill = { type: "pattern", pattern: "solid", fgColor: { argb: r.fill } }; }); }
       (sh.widths || []).forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+      for (const [i, f] of Object.entries(sh.numFmts || {})) ws.getColumn(+i + 1).numFmt = f;
+      if (sh.freeze) ws.views = [{ state: "frozen", ySplit: sh.freeze }];
+      if (sh.filter) ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: sh.filter.rows + 1, column: sh.filter.cols } };
     }
     const buf = await wb.xlsx.writeBuffer();
     const url = URL.createObjectURL(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
@@ -1029,11 +1287,26 @@
     }
     await saveXlsx("erected", [{ name: L2("Монтирани", "Erected"), rows, widths: [12, 12, 20, 30, 26, 18] }]);
   }
+  // "По марки" and "Статус по сглобки" with fabrication dates, weights and % by weight (week 3, A14; steel.js).
+  // Weight: the model's ASSEMBLY weight (pset "Assembly", property Assembly_Weight), as read at load.
+  const isDeliveredFab = (g) => R.fabDelivered(state.fab, g);
+  const HDR = "FFECE8DF";
+  const noWeightNote = () => ({ values: [L2("Теглото липсва в заредения модел (Assembly_Weight) – колоните за тегло са празни.", "The weight is missing in the loaded model (Assembly_Weight) – the weight columns are empty.")] });
   async function exportMarks() {
-    const av = avail();
-    const rows = [{ values: [L2("Марка", "Mark"), L2("Бр. в модела", "In model"), L2("Доставени", "Delivered"), L2("Доставени: въведени", "Delivered: typed"), L2("Доставени: Excel", "Delivered: Excel"), L2("Източник", "Source"), L2("Монтирани", "Erected"), L2("Налични (дост. − монт.)", "Available (deliv. − erect.)"), L2("Светнали за монтаж", "Instances ready"), L2("Не доставени", "Not delivered"), L2("Задържани", "On hold"), L2("Грешни", "Wrong")], bold: true, fill: "FFECE8DF" }];
-    for (const m of av.marks) rows.push({ values: [m.mark, m.instances, m.delivered, m.typed, m.excel, srcName(m.source), m.erected, m.available, m.ready, m.notDelivered, m.hold, m.wrong] });
-    await saveXlsx("by-mark", [{ name: L2("По марки", "By mark"), rows, widths: [12, 10, 10, 12, 12, 16, 10, 14, 14, 12, 10, 10] }]);
+    const x = L.markExportRows(avail(), state.asms, { fab: state.fab, status: state.status, isDelivered: isDeliveredFab, srcName, lang });
+    const rows = [{ values: x.header, bold: true, fill: HDR }, ...x.rows.map((v) => ({ values: v })), { values: x.total, bold: true }, { values: [] },
+      { values: [L2("Тегло: ASSEMBLY тегло от модела, kg. Доставено (kg) = доставени бр. × средното тегло на марката. „Общо“ сумира само видимите редове при филтър.",
+        "Weight: the model's ASSEMBLY weight, kg. Delivered (kg) = delivered qty × the mark's average weight. \"Total\" sums only the rows shown by a filter.")] }];
+    if (x.noWeight) rows.push(noWeightNote());
+    await saveXlsx("by-mark", [{ name: L2("По марки", "By mark"), rows, widths: [12, 10, 10, 12, 12, 16, 10, 14, 14, 12, 10, 10, 11, 12, 12, 13, 13, 12, 13, 13, 13, 13, 12, 12, 12],
+      numFmts: Object.fromEntries(x.pctCols.map((i) => [i, "0.0%"])), freeze: 1, filter: { rows: x.rows.length, cols: x.header.length } }]);
+  }
+  async function exportInstances() {
+    const x = L.instanceExportRows(state.asms, { state: avail().state, stateName, fab: state.fab, status: state.status, holds: state.holds, isDelivered: isDeliveredFab, lang });
+    const rows = [{ values: x.header, bold: true, fill: HDR }, ...x.rows.map((v) => ({ values: v })), { values: x.total, bold: true }];
+    if (x.noWeight) rows.push({ values: [] }, noWeightNote());
+    await saveXlsx("by-assembly", [{ name: L2("По сглобки", "By assembly"), rows, widths: [12, 11, 18, 12, 16, 16, 12, 18, 24, 24, 24, 18, 22, 26],
+      freeze: 1, filter: { rows: x.rows.length, cols: x.header.length } }]);
   }
   async function exportDeliveries() {
     const rows = [{ values: [L2("Дата", "Date"), "№", L2("Марка", "Mark"), L2("Бр.", "Qty"), L2("От", "By"), L2("Източник", "Source"), L2("Анулирана", "Cancelled")], bold: true, fill: "FFECE8DF" }];
@@ -1048,21 +1321,42 @@
   }
 
   // ---------- selection ----------
+  // a part or bolt is looked up in the map built at load (speed audit item 9a: a box-select of 500 parts was 500 calls
+  // in a row); only ids the map does not know are asked from the viewer, 6 at a time. A newer selection wins.
+  // While the parts are still loading (phase B) a few unknown ids (a clicked part) are asked as before; a box-select of
+  // more waits for the parts instead of thousands of calls, with "зареждане на частите…" in the status line.
+  let selGen = 0;
+  const FEW_UNKNOWN = 8;
   async function fromViewer() {
+    const my = ++selGen;
     const s = (await state.api.viewer.getSelection()) || [];
-    const picked = new Map();
-    for (const m of s) for (const id of m.objectRuntimeIds || []) {
-      const a = state.byKey.get(key(m.modelId, id));
-      if (a) { picked.set(a.guid, a); continue; }
-      const p = await parentAssembly(m.modelId, id);   // a part was clicked: take its assembly
-      if (p) picked.set(p.guid, p);
+    let r = L.selectionAssemblies(s, state.byKey, state.asmOfChild);
+    if (r.unknown.length > FEW_UNKNOWN && !state.partsReady) {
+      setStatus(partsText());
+      await waitParts();
+      if (my !== selGen) return;
+      r = L.selectionAssemblies(s, state.byKey, state.asmOfChild);
+      if (!state.partsReady) { if (state.ready) statusLine(false); return; }   // parts not read: no thousands of calls
+      statusLine(true);
     }
-    state.sel = [...picked.values()]; selChanged();
+    if (r.unknown.length) await pool(r.unknown, 6, async (u) => { r.list[u.at] = await parentAssembly(u.modelId, u.id); });
+    if (my !== selGen) return;
+    state.sel = L.uniqueAssemblies(r.list); selChanged();
     render();
   }
   async function selectMark(mark) {
-    const list = state.asms.filter((a) => L.normMark(a.mark) === L.normMark(mark));
+    let list = state.asms.filter((a) => L.normMark(a.mark) === L.normMark(mark));
     state.sel = list; selChanged();
+    if (!state.partsReady) {
+      // the status buttons work at once; the pieces are shown in the model when the parts are in (phase B)
+      render();
+      setStatus(partsText() + L2(" Марката ще се избере в модела след малко.", " The mark will be selected in the model in a moment."));
+      await waitParts();
+      if (state.sel !== list || !state.partsReady) return;   // another selection meanwhile / parts not read
+      list = list.map((a) => state.byGuid.get(a.guid)).filter(Boolean);   // a newer load's objects
+      state.sel = list;
+      statusLine(true);
+    }
     const s = sel(list);
     await state.api.viewer.setSelection(s, "set");
     try { await state.api.viewer.setCamera(s, { animationTime: 400 }); } catch {}
@@ -1073,9 +1367,13 @@
   document.addEventListener("click", (e) => {
     const b = e.target.closest("button[data-act], #tabs button");
     if (!b) return;
-    if (b.dataset.tab) { state.tab = b.dataset.tab; state.fabClearArmed = 0; render(); return; }
+    if (b.dataset.tab) { state.tab = b.dataset.tab; state.fabClearArmed = 0; saveView(); render(); return; }
     const act = b.dataset.act;
-    guarded(async () => {
+    // write buttons: refused while the model is being (re)loaded, counted while they run (review 10 M3)
+    const WRITES = ["on", "off", "dlvAdd", "dlvCancel", "dlvPendOk", "fabApply", "moveLegacy", "clearFab", "noBackupGo"];
+    const isWrite = WRITES.includes(act);
+    if (isWrite && book.loading) return flash(L2("Моделът се презарежда – опитайте след малко.", "The model is reloading – try again in a moment."), true);
+    guarded(() => (isWrite ? writing : (fn) => fn())(async () => {
       if (act === "on" || act === "off") await applyFlag(b.dataset.kind, act === "on");
       else if (act === "pickMark") await selectMark(b.dataset.mark);
       else if (act === "dlvAdd") await addDelivery(R.parseDeliveryText($("dlvText").value).lines, "typed");
@@ -1097,12 +1395,23 @@
       }
       else if (act === "noBackupNo") { state.noBackupAsk = null; setStatus(L2("Отказано – нищо не е променено.", "Cancelled – nothing was changed.")); render(); }
       else if (act === "fabCancel") { state.fabPlan = null; setStatus(L2("Импортът е отказан.", "Import cancelled.")); render(); }
+      else if ((act === "boltXlsx" || act === "boltPdf") && !state.partsReady) flash(partsText(), true);
       else if (act === "boltXlsx") await exportBoltsXlsx();
       else if (act === "boltPdf") exportBoltsPdf();
       else if (act === "docErected") await exportErected();
       else if (act === "docMarks") await exportMarks();
       else if (act === "docDeliveries") await exportDeliveries();
-    });
+      else if (act === "docInstances") await exportInstances();
+      else if (act === "fabFilesRefresh") await refreshFabFiles();
+      else if (act === "fabFromConnect") await importFromConnect(b.dataset.id);
+    }));
+  });
+  // Enter in the mark search with exactly one match selects that mark in the model (A5)
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" || !e.target || e.target.id !== "markFilter" || !state.ready) return;
+    e.preventDefault();
+    const shown = shownMarks(avail());
+    if (shown.length === 1) guarded(() => selectMark(shown[0].mark));
   });
   $("btnSelClear").onclick = () => { state.sel = []; state.fabClearArmed = 0; state.flagArmed = null; state.noBackupAsk = null; state.drafts = {}; state.draftSel = null; render(); };
   // typed dates and notes survive re-renders until saved or the selection is cleared (week 1, F6). They belong to the
@@ -1113,6 +1422,13 @@
   }
   document.addEventListener("input", (e) => {
     const id = e.target.id || "";
+    // search (round 12, L3): the figures of the last render (they change with the data, not with typing), 80 ms debounce
+    if (id === "markFilter") {
+      state.markFilter = e.target.value;
+      clearTimeout(filterTimer);
+      filterTimer = setTimeout(() => { if (state.ready && $("markRows")) fillMarkRows(lastAv || avail()); }, 80);
+      return;
+    }
     if (/^dlv(Date|No|Text)$/.test(id)) { state.dlvDraft = Object.assign(state.dlvDraft || {}, { [id]: e.target.value }); return; }   // round 8 M5
     const m = /^([dn])_(erected|wrong|hold)$/.exec(id);
     if (!m) return;
@@ -1121,23 +1437,107 @@
     state.draftSel = state.sel.map((a) => a.guid);
     if (m[1] === "d") { const h = $("h_" + m[2]); if (h) h.hidden = !oldDate(e.target.value); }
   });
-  $("chkFollow").onchange = (e) => { state.follow = e.target.checked; };
-  $("chkColour").onchange = (e) => guarded(async () => { state.coloured = e.target.checked; await applyColours(); });
+  $("chkFollow").onchange = (e) => { state.follow = e.target.checked; saveView(); };
+  $("chkColour").onchange = (e) => guarded(async () => { state.coloured = e.target.checked; saveView(); $("legend").classList.toggle("off", !state.coloured); await applyColours(); });
   $("selLang").value = lang;
   $("selLang").onchange = (e) => { lang = e.target.value; try { localStorage.setItem("arsten.assemblyStatus.lang", lang); } catch {} render(); };
 
   let loadGen = 0;
+  // Audit item 8 (smallest step): the loaded model set {id@versionId} of the last load that finished (records and
+  // parts). A model event that leaves it unchanged (Connect fires them for streaming and visibility too) re-reads
+  // nothing: only the colours are painted again. A missing versionId never compares equal (L.modelSetKey).
+  let lastModelsKey = null;
+  const activeLoads = new Set();   // generations whose phase A or B still runs
+  /** Every model (re)load goes through here: it waits while writes are in flight (M3), and while phase A (assemblies
+   *  + records) runs the write buttons are refused (book.loading). Phase B (parts, bolts) runs on in the background. */
   async function load() {
+    if (inflight > 0) { reloadSoon(1000); return; }
+    if (await modelsUnchanged()) return;
+    book.loadStarted();
+    try { await loadNow(); } finally { book.loadEnded(); }
+  }
+  async function modelsUnchanged() {
+    if (!state.ready || !state.partsReady || activeLoads.size || lastModelsKey == null) return false;
+    const gen = loadGen, k = L.modelSetKey(await loadedModels());
+    if (gen !== loadGen || activeLoads.size || !L.sameModelSet(lastModelsKey, k)) return false;
+    console.info("[Стомана] model event: the loaded models did not change – no reload");
+    if (state.coloured) await applyColours();
+    return true;
+  }
+  function reloadSoon(ms) { clearTimeout(reloadTimer); reloadTimer = setTimeout(() => guarded(load), ms); }
+
+  // ---------- waiting for the parts (phase B) ----------
+  const partsText = () => L2("Зареждане на частите…", "Loading the parts…");
+  let partsWait = null;
+  /** Resolves when the newest load's parts are in, or that load ended without them (error / no assemblies). */
+  function waitParts() {
+    if (state.partsReady || state.partsError || !activeLoads.size) return Promise.resolve();
+    if (!partsWait) { let resolve; const promise = new Promise((r) => { resolve = r; }); partsWait = { promise, resolve }; }
+    return partsWait.promise;
+  }
+  function partsSettled() { const w = partsWait; partsWait = null; if (w) w.resolve(); }
+  const headText = () => `${state.asms.length} ${L2("сглобки", "assemblies")} · ${new Set(state.asms.map((a) => a.mark)).size} ${L2("марки", "marks")}`;
+  function partsProgress(n, of, bolts) {
+    const what = bolts ? L2(`болтове ${n} от ${of}`, `bolts ${n} of ${of}`) : `${n} ${L2("от", "of")} ${of}`;
+    setStatus((state.ready ? headText() + " · " : "") + partsText() + " " + what);
+  }
+  /** The status line after a load: phase A done (parts still loading, or failed) or both phases done. */
+  function statusLine(partsDone) {
+    if (!partsDone) {
+      setStatus(headText() + " · " + (state.partsError ? L2("⚠ частите не са прочетени – презаредете панела", "⚠ the parts could not be read – reload the panel") : partsText()), !!state.partsError);
+      return;
+    }
+    const site = state.bolts.filter((b) => b.sides && (b.sides.others || []).length).length;
+    const st = state.loadStats || {};
+    const warn = [];
+    if (st.dupAsms || st.dupBolts) warn.push(L2(`заредени два пъти (припокриващи се модели): ${st.dupAsms} сглобки, ${st.dupBolts} болта – броени веднъж`,
+      `loaded twice (overlapping models): ${st.dupAsms} assemblies, ${st.dupBolts} bolts – counted once`));
+    if (st.childErrors) warn.push(L2(`${st.childErrors} сглобки без прочетени елементи`, `${st.childErrors} assemblies whose parts could not be read`));
+    if (st.lookupFailed) warn.push(L2(`${st.lookupFailed} основни елемента не можаха да се потърсят – презаредете`, `${st.lookupFailed} main parts could not be looked up – reload`));
+    const head = headText();
+    if (office()) setStatus(`${head} · ${state.bolts.length} ${L2("болтови групи", "bolt groups")} (${site} ${L2("между две сглобки", "between two assemblies")})`
+      + (st.slowLookups ? ` · ${L2("бавно търсене", "slow lookups")}: ${st.slowLookups}` : "")
+      + (warn.length ? " · ⚠ " + warn.join("; ") : ""), !!warn.length);
+    else {   // site roles: one plain sentence, no load diagnostics (week 3, A8)
+      const broken = st.childErrors || st.lookupFailed;
+      setStatus(head + (broken ? L2(" · ⚠ част от модела не е прочетена – презаредете панела", " · ⚠ part of the model could not be read – reload the panel") : ""), !!broken);
+    }
+  }
+  /** A load's two phases meet here: records in -> the panel is shown; records and parts in -> colours, and the model
+   *  set counts as loaded (item 8). Only the newest load settles. */
+  async function settle(run) {
+    if (run.gen !== loadGen || !run.records) return;
+    statusLine(run.parts);
+    render();
+    if (!run.parts) return;
+    lastModelsKey = run.modelsKey;
+    if (state.coloured || colourDeferred) await applyColours();
+  }
+
+  async function loadNow() {
     const gen = ++loadGen;
-    try { if (!(await loadModel(gen))) return; }   // a newer load took over
-    catch (e) { if (gen !== loadGen) return; throw e; }   // an error of a superseded load (its model was unloaded) is not shown (L1)
+    activeLoads.add(gen);
+    lastModelsKey = null;   // until this load settles: a load that fails never leaves an older set "unchanged"
+    let background = false;   // phase B started: it ends the load
+    try { background = await loadPhaseA(gen); }
+    finally { if (!background) { activeLoads.delete(gen); if (gen === loadGen) partsSettled(); } }
+  }
+  /** Phase A (assemblies, then records), with phase B started in the background as soon as the assemblies are in.
+   *  Returns true when phase B was started. */
+  async function loadPhaseA(gen) {
+    const specs = await loadedModels();   // read once: the model set (item 8) and the versions of the child cache (2a)
+    const run = { gen, modelsKey: L.modelSetKey(specs), records: false, parts: false };
+    const ctx = { stale: () => gen !== loadGen, all: null, failed: 0 };   // this load's own object cache and lookup failures
+    let got;
+    try { got = await loadAssemblies(gen, ctx); if (!got) return false; }   // a newer load took over
+    catch (e) { if (gen !== loadGen) return false; throw e; }   // an error of a superseded load (its model was unloaded) is not shown (L1)
     clearTimeout(waitTimer);
     if (!state.asms.length && !(allObjects || []).length && waitTries < 30) {
       // no objects yet: the panel opened before a model was loaded, or the model is still streaming in
       waitTries++;
       setStatus(L2("Чакам да се зареди модел…", "Waiting for a model to load…"));
       waitTimer = setTimeout(() => guarded(load), 4000);
-      return;
+      return false;
     }
     waitTries = 0;
     if (!state.asms.length) {
@@ -1146,31 +1546,33 @@
       for (const o of allObjects || []) cls.set(o.cls || "?", (cls.get(o.cls || "?") || 0) + 1);
       const seen = [...cls].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([c, n]) => `${c} ${n}`).join(", ");
       setStatus(L2("В заредените модели няма сглобки (IfcElementAssembly).", "No assemblies (IfcElementAssembly) in the loaded models.") +
-        ` [${(allObjects || []).length} obj${seen ? ": " + seen : ""}]`, true); return;
+        (office() ? ` [${(allObjects || []).length} obj${seen ? ": " + seen : ""}]` : ""), true); return false;   // diagnostics: office / admin only (A8)
     }
-    try { if (!(await loadRecords(gen)) && gen !== loadGen) return; }
-    catch (e) { if (gen !== loadGen) return; throw e; }   // an error of a superseded load is not shown (round 4, L8)
+    // phase B: the parts and bolts, at the same time as the records (viewer calls vs. pset-api calls)
+    loadParts(gen, ctx, got, modelVersions(specs)).then(
+      (ok) => { if (!ok || gen !== loadGen) return; run.parts = true; partsSettled(); return guarded(() => settle(run)); },
+      (e) => {
+        if (gen !== loadGen) return;   // an error of a superseded load is not shown
+        state.partsError = errText(e); console.error(e);
+        partsSettled();
+        if (state.ready) { statusLine(false); render(); }
+        toast(L2("Частите не са прочетени: ", "The parts could not be read: ") + state.partsError, true);
+      }).finally(() => activeLoads.delete(gen));
+    try { if (!(await loadRecords(gen)) && gen !== loadGen) return true; }
+    catch (e) { if (gen !== loadGen) return true; throw e; }   // an error of a superseded load is not shown (round 4, L8)
+    run.records = true;
     state.ready = true;
     $("main").hidden = false;
-    const site = state.bolts.filter((b) => b.sides && (b.sides.others || []).length).length;
-    const st = state.loadStats || {};
-    const warn = [];
-    if (st.dupAsms || st.dupBolts) warn.push(L2(`заредени два пъти (припокриващи се модели): ${st.dupAsms} сглобки, ${st.dupBolts} болта – броени веднъж`,
-      `loaded twice (overlapping models): ${st.dupAsms} assemblies, ${st.dupBolts} bolts – counted once`));
-    if (st.childErrors) warn.push(L2(`${st.childErrors} сглобки без прочетени елементи`, `${st.childErrors} assemblies whose parts could not be read`));
-    if (st.lookupFailed) warn.push(L2(`${st.lookupFailed} основни елемента не можаха да се потърсят – презаредете`, `${st.lookupFailed} main parts could not be looked up – reload`));
-    setStatus(`${state.asms.length} ${L2("сглобки", "assemblies")} · ${new Set(state.asms.map((a) => a.mark)).size} ${L2("марки", "marks")} · ${state.bolts.length} ${L2("болтови групи", "bolt groups")} (${site} ${L2("между две сглобки", "between two assemblies")})`
-      + (st.slowLookups ? ` · ${L2("бавно търсене", "slow lookups")}: ${st.slowLookups}` : "")
-      + (warn.length ? " · ⚠ " + warn.join("; ") : ""), !!warn.length);
-    render();
-    if (state.coloured) await applyColours();
+    await settle(run);
+    return true;
   }
   async function start(api, client) {
     state.api = api;
-    state.access = window.ARSTEN_DEMO ? { allowed: true, role: "admin" } : await ArstenAccess.check({ api, getToken, app: "assembly" });
+    state.access = window.ARSTEN_DEMO ? (window.ARSTEN_DEMO_ACCESS || { allowed: true, role: "admin" }) : await ArstenAccess.check({ api, getToken, app: "assembly" });
     if (!state.access.allowed) { state.denied = true; state.api = null; ArstenAccess.renderDenied(document.body, lang, state.access); return; }
     state.project = (await api.project.getProject()) || {};
-    try { const u = await api.user.getUser(); state.user = [u.firstName, u.lastName].filter(Boolean).join(" ") || u.email || ""; } catch {}
+    try { const u = await api.user.getUser(); state.user = [u.firstName, u.lastName].filter(Boolean).join(" ") || u.email || ""; state.userId = u.id || u.email || ""; } catch {}
+    loadView();   // colouring (default on), follow and tab, per user (week 3, A7)
     state.client = client || new A.PsetClient({ region: state.project.location || "europe", getToken });
     render();
     await guarded(load);
@@ -1184,7 +1586,7 @@
     // models loaded by a stage may still be streaming in while the first load runs: reload on their events too; the
     // load generation makes the older load stand down (review round 3, M2)
     // 3 s: a stage loads its models one after the other; one reload after the last of them (round 4, L9)
-    if (event === "viewer.onModelStateChanged") { clearTimeout(reloadTimer); reloadTimer = setTimeout(() => guarded(load), 3000); }
+    if (event === "viewer.onModelStateChanged") reloadSoon(3000);
     if (!state.ready) return;
     if (event === "viewer.onSelectionChanged" && state.follow) { clearTimeout(selTimer); selTimer = setTimeout(() => guarded(fromViewer), 200); }
   }
