@@ -1,7 +1,7 @@
 # Assembly status: steel erection (Trimble Connect 3D viewer)
 
 Statuses per assembly instance (Монтиран / Грешно изработен / Задържан), deliveries per mark, ready-for-erection
-colours and the bolt erection list. Design and data model: [DESIGN.md](DESIGN.md).
+colours and the bolt erection list. Part of Arsten / Multiplan.
 
 | File | What |
 |---|---|

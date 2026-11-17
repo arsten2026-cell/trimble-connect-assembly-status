@@ -195,5 +195,16 @@
     return Object.keys(change.set).filter((f) => stored(f, (previewCur || {})[f]) !== stored(f, (freshCur || {})[f]));
   }
 
-  return { DEF_ID, PSET, FIELDS, NOTE_MAX, definition, parseDate, fromSerial, readSheet, plan, stored, patchFor, changedSince };
+  /**
+   * The rows an import leaves out because their assembly is not in the loaded stage / models (week 4, A16), grouped
+   * by mark for the preview: [{mark, n}] sorted by mark (natural order), plus total. notLoaded: plan(...).notLoaded.
+   */
+  function skippedByMark(notLoaded) {
+    const by = new Map();
+    for (const m of notLoaded || []) { const k = String(m || "?"); by.set(k, (by.get(k) || 0) + 1); }
+    const list = [...by].map(([mark, n]) => ({ mark, n })).sort((a, b) => a.mark.localeCompare(b.mark, undefined, { numeric: true }));
+    return { total: (notLoaded || []).length, list };
+  }
+
+  return { DEF_ID, PSET, FIELDS, NOTE_MAX, definition, parseDate, fromSerial, readSheet, plan, stored, patchFor, changedSince, skippedByMark };
 });

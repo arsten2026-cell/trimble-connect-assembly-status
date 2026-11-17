@@ -17,17 +17,27 @@
     view: ["Изглед", "View"], colour: ["Оцвети по статус", "Colour by status"],
     marks: ["Марки", "Marks"], deliveries: ["Доставки", "Deliveries"], fab: ["Производство", "Fabrication"], bolts: ["Болтове", "Bolts"], docs: ["Документи", "Documents"],
     erected: ["Монтиран", "Erected"], wrong: ["Грешно изработен", "Wrong (fabrication)"], hold: ["Задържан", "On hold"],
-    set: ["Отбележи", "Set"], undo: ["Отмени", "Undo"], note: ["Бележка", "Note"], reason: ["Причина", "Reason"],
+    set: ["Отбележи", "Set"], undo: ["Премахни", "Remove"], note: ["Бележка", "Note"], reason: ["Причина", "Reason"],
     noRight: ["Нямате права за това.", "You have no rights for this."],
   };
-  let lang = (() => { try { return localStorage.getItem("arsten.assemblyStatus.lang") || "bg"; } catch { return "bg"; } })();
+  // one language for all tools (A10): shared key "arsten.lang" (shared/arsten-i18n.js), the old key read once
+  const I18N = window.ArstenI18n, OLD_LANG = ["arsten.assemblyStatus.lang"];
+  let lang = I18N ? I18N.getLang(OLD_LANG) : "bg";
   const t = (k) => (T[k] ? T[k][lang === "bg" ? 0 : 1] : k);
   const L2 = (b, e) => (lang === "bg" ? b : e);
+  // counted forms (round 19 L6): "1 сглобка" / "2 сглобки", "1 марка" / "2 марки", "1 запис" / "2 записа"
+  const nW = (n, one, many, en1, enN) => `${n} ${lang === "bg" ? (Math.abs(Number(n)) === 1 ? one : many) : (Math.abs(Number(n)) === 1 ? en1 : enN)}`;
+  const nAsm = (n) => nW(n, "сглобка", "сглобки", "assembly", "assemblies");
+  const nMark = (n) => nW(n, "марка", "марки", "mark", "marks");
+  const nRec = (n) => nW(n, "запис", "записа", "record", "records");
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const num = (v) => { const n = parseFloat(String(v == null ? "" : v).replace(",", ".")); return isFinite(n) ? String(Math.round(n * 10) / 10) : String(v == null ? "" : v); };
   const oldDate = (d) => { if (!d) return false; const t0 = new Date(); t0.setDate(t0.getDate() - 7); return String(d) < `${t0.getFullYear()}-${String(t0.getMonth() + 1).padStart(2, "0")}-${String(t0.getDate()).padStart(2, "0")}`; };   // > 7 days back (A6)
-  const fmtDate = (d) => (d ? (lang === "bg" ? String(d).split("-").reverse().join(".") : d) : "");
-  function setStatus(text, bad) { $("status").textContent = text; $("status").className = "status" + (bad ? " bad" : ""); }
+  // one date format in every panel (round 14 M4): BG 17.11.2026, EN 17 Nov 2026
+  const fmtDate = (d) => (!d ? "" : I18N ? I18N.fmtDate(d, lang) : lang === "bg" ? String(d).split("-").reverse().join(".") : d);
+  // round 19 L4: the load's status line (statusLine) is built again after a language switch; any other status is not
+  let statusIsLine = null;
+  function setStatus(text, bad) { statusIsLine = null; $("status").textContent = text; $("status").className = "status" + (bad ? " bad" : ""); }
   // the result of a write is also shown at the bottom, next to the user's finger on a tablet (week 1, A2)
   let toastTimer = 0;
   function toast(text, bad) {
@@ -122,12 +132,12 @@
     const p = new Promise((resolve, reject) => {
       done = (tk) => { clearTimeout(timer); resolve(tk); };
       waiters.push(done);
-      timer = setTimeout(() => { waiters = waiters.filter((f) => f !== done); reject(new Error("No access token from Trimble Connect")); }, 60000);
+      timer = setTimeout(() => { waiters = waiters.filter((f) => f !== done); reject(new Error(L2("Trimble Connect не даде ключ за достъп", "No access token from Trimble Connect"))); }, 60000);
     });
     const drop = () => { clearTimeout(timer); waiters = waiters.filter((f) => f !== done); p.catch(() => {}); };
     let r;
     try { r = await state.api.extension.requestPermission("accesstoken"); } catch (e) { drop(); throw e; }
-    if (r === "denied") { drop(); throw new Error("Access to Trimble Connect data was denied for this extension."); }
+    if (r === "denied") { drop(); throw new Error(L2("Достъпът до данните в Trimble Connect е отказан за това разширение.", "Access to Trimble Connect data was denied for this extension.")); }
     if (r && r !== "pending" && r !== "granted") { drop(); token = r; return r; }
     return p;
   }
@@ -425,6 +435,7 @@
     if (!current()) return false;
     if (!found.lib) {
       state.lib = null;
+      if (found.denied) console.warn("library not readable", "STEEL/Монтаж", JSON.stringify({ denied: found.denied }));   // round 19 M1: into the diagnostics
       $("setupBox").hidden = false;
       $("setupBox").innerHTML = found.denied ? L2(`Библиотеката <b>STEEL/Монтаж</b> не е видима за вас – може да съществува, но без достъп за вас. Попитайте администратора на проекта, преди някой да създаде нова.`,
         `The library <b>STEEL/Монтаж</b> is not visible to you – it may exist without access for you. Ask the project admin before anyone creates a new one.`) : L2(`Библиотеката <b>STEEL/Монтаж</b> още не съществува. Администратор я създава веднъж в Connect: Property Set Libraries → New library → име „STEEL/Монтаж“. Статусите не могат да се записват дотогава.`,
@@ -553,7 +564,8 @@
     const res = await ArstenBackup.save({ core: coreFor(), projectId: state.project.id, snapshot: snap, cache: backupCache });
     const allowed = state.noBackupOk === action;
     state.noBackupOk = null;
-    if (res.uploaded) return ArstenBackup.note(res, lang);
+    // the path only for the office side; site roles see "Архивът е запазен" (A11)
+    if (res.uploaded) return office() || !I18N ? ArstenBackup.note(res, lang) : " · " + I18N.word("backupSaved", lang);
     console.warn("backup not uploaded to Connect", res.error);
     const text = res.downloaded ? ArstenBackup.failedText(lang)
       : L2("Архивът НЕ е запазен – нито е качен в Connect, нито е изтеглен", "The backup was NOT saved – neither uploaded to Connect nor downloaded");
@@ -636,7 +648,7 @@
     });
     if (done && !failed) delete state.drafts[kind];
     const skipped = on ? state.sel.length - targets.length : 0;
-    flash(`${t(kind)}: ${on ? L2("записано", "saved") : L2("отменено", "undone")} ${done}`
+    flash(`${t(kind)}: ${on ? L2("записано", "saved") : L2("премахнато", "removed")} ${done}`
       + (skipped ? ` · ${skipped} ${L2("вече отбелязани – не са променени", "already marked – left as they were")}` : "")
       + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "") + bak, failed > 0);
     render();
@@ -655,7 +667,7 @@
     state.deliveries.unshift(shown); book.add("deliveries", link, shown);
     const known = new Set(state.asms.map((a) => L.normMark(a.mark)));
     const unknown = lines.filter((l) => !known.has(l.mark)).map((l) => l.mark);
-    flash(L2(`Доставката е записана (${lines.length} марки)`, `Delivery saved (${lines.length} marks)`) + (unknown.length ? ` · ${L2("няма в модела", "not in the model")}: ${unknown.join(", ")}` : ""), unknown.length > 0);
+    flash(L2(`Доставката е записана (${nMark(lines.length)})`, `Delivery saved (${nMark(lines.length)})`) + (unknown.length ? ` · ${L2("няма в модела", "not in the model")}: ${unknown.join(", ")}` : ""), unknown.length > 0);
     $("dlvText").value = ""; $("dlvNo").value = ""; state.dlvDraft = null;
     render();
     if (state.coloured) await applyColours();
@@ -687,7 +699,7 @@
       s.src = "https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js";
       s.integrity = "sha384-Pqp51FUN2/qzfxZxBCtF0stpc9ONI6MYZpVqmo8m20SoaQCzf+arZvACkLkirlPz"; s.crossOrigin = "anonymous";
       s.onload = () => resolve(window.ExcelJS);
-      s.onerror = () => { excelLoad = null; reject(new Error("Could not load the Excel library")); };
+      s.onerror = () => { excelLoad = null; reject(new Error(L2("Библиотеката за Excel не се зареди", "Could not load the Excel library"))); };
       document.head.appendChild(s);
     }));
   }
@@ -778,8 +790,10 @@
     const known = new Map(state.asms.map((a) => [a.guid, { mark: a.mark }]));
     state.fabPlan = { source: file.name, ref: ref || null, p: F.plan(rows, { toIfc: L.tcGuidToIfc, known, existing: state.fab, date1904: wb.date1904 }) };
     state.tab = "fab";
+    const outside = state.fabPlan.p.notLoaded.length;   // A16: assemblies not in the loaded stage / models
     setStatus(L2(`Прочетен ${file.name}: проверете промените и натиснете „Запиши“.`, `Read ${file.name}: check the changes and press "Save".`)
-      + (skipped.length ? L2(` Пропуснати листове (без GUID / дати): `, ` Sheets skipped (no GUID / dates): `) + skipped.join(", ") : ""), skipped.length > 0);   // round 5, L5
+      + (outside ? L2(` Пропуснати ${nAsm(outside)} извън заредения етап.`, ` ${nAsm(outside)} outside the loaded stage skipped.`) : "")
+      + (skipped.length ? L2(` Пропуснати листове (без GUID / дати): `, ` Sheets skipped (no GUID / dates): `) + skipped.join(", ") : ""), skipped.length > 0 || outside > 0);   // round 5, L5
     render();
   }
   /** A raw-"$" copy of this record was found at load time (any kind: move / merge / stale). */
@@ -825,7 +839,7 @@
       } catch (e) { failed++; if (!first) first = e.status === 403 ? noRight() : errText(e); }
     });
     await loadRecords();
-    flash(L2(`Преместени ${done} записа.`, `Moved ${done} records.`) + (skipped ? ` · ${skipped} ${L2("без права", "no right")}` : "")
+    flash(L2(`Преместени ${nRec(done)}.`, `Moved ${nRec(done)}.`) + (skipped ? ` · ${skipped} ${L2("без права", "no right")}` : "")
       + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
       + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize.") + bak, failed > 0);
     render();
@@ -869,7 +883,7 @@
       catch (e) { failed++; if (!first) first = e.status === 403 ? noRight() : errText(e); }
     });
     await loadRecords();
-    flash(L2(`Изтрити дати: ${done} сглобки.`, `Dates cleared: ${done} assemblies.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
+    flash(L2(`Изтрити дати: ${nAsm(done)}.`, `Dates cleared: ${nAsm(done)}.`) + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "")
       + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize.") + bak, failed > 0);
     render();
     if (state.coloured) await applyColours();   // DelivDate counts as delivered (owner's rule 16.11.2026)
@@ -919,7 +933,7 @@
       fp.p.overwrites = failedList.reduce((n, c) => n + c.over.length, 0);
       fp.p.fills = failedList.reduce((n, c) => n + Object.keys(c.set).length, 0) - fp.p.overwrites;
     } else state.fabPlan = null;
-    flash(L2(`Записани ${done} сглобки.`, `Saved ${done} assemblies.`)
+    flash(L2(`Записани ${nAsm(done)}.`, `Saved ${nAsm(done)}.`)
       + (meanwhile.length ? L2(` · ${meanwhile.length} променени междувременно от друг – не са записани, импортирайте файла пак: `, ` · ${meanwhile.length} changed by someone else meanwhile – not saved, import the file again: `) + meanwhile.slice(0, 10).join(", ") + "." : "")
       + (failedList.length ? ` · ${failedList.length} ${L2("грешки", "failed")} (${first})` : "")
       + L2(" В Tekla: Trimble Connect → Property sets → синхронизиране.", " In Tekla: Trimble Connect → Property sets → synchronize.") + bak, failedList.length + meanwhile.length > 0);
@@ -1063,9 +1077,9 @@
       const dateVal = dr.date != null ? dr.date : on.correcting ? same(`${kind}_date`) : R.today();
       const noteVal = dr.note != null ? dr.note : same(noteKey);
       const mixed = on.correcting && (!same(`${kind}_date`) || !same(noteKey));
-      const onLbl = flagArmed(kind, true, on.list.length) ? L2(`Потвърди: ${on.list.length} сглобки`, `Confirm: ${on.list.length} assemblies`)
+      const onLbl = flagArmed(kind, true, on.list.length) ? L2(`Потвърди: ${nAsm(on.list.length)}`, `Confirm: ${nAsm(on.list.length)}`)
         : on.correcting ? L2(`Поправи (${on.list.length})`, `Correct (${on.list.length})`) : `${t("set")}${sel.length ? ` (${on.list.length})` : ""}`;
-      const offLbl = flagArmed(kind, false, off.list.length) ? L2(`Потвърди: отмени ${off.list.length}`, `Confirm: undo ${off.list.length}`) : `${t("undo")}${off.list.length ? ` (${off.list.length})` : ""}`;
+      const offLbl = flagArmed(kind, false, off.list.length) ? L2(`Потвърди: премахни ${off.list.length}`, `Confirm: remove ${off.list.length}`) : `${t("undo")}${off.list.length ? ` (${off.list.length})` : ""}`;
       return `<div class="act" style="--c:${colour}">
       <div class="hd"><span class="nm">${esc(t(kind))}</span><span class="st">${sel.length ? `${has(store, kind)}/${sel.length}` : ""}</span></div>
       <div class="row">${kind === "erected" || kind === "hold" ? `<input type="date" id="d_${kind}" max="${R.today()}" value="${esc(dateVal)}"><span class="sub" id="h_${kind}" ${dr.date != null && oldDate(dr.date) ? "" : "hidden"}>${esc(L2("проверете датата", "check the date"))}</span>` : ""}<input type="text" id="n_${kind}" value="${esc(noteVal)}" placeholder="${esc(mixed ? L2("различни – празно = без промяна", "differ – empty = unchanged") : noteLbl + (needNote ? " *" : ""))}"></div>
@@ -1090,6 +1104,17 @@
     const bl = $("build"); if (bl) bl.textContent = `Стомана v${BUILD}`;
   }
 
+  /** A16 (week 4): the rows an import leaves out because their assemblies are not in the loaded stage / models – count,
+   *  the full list by mark, and what to do. Shown at the top of the preview, so nobody thinks they were saved. */
+  function skippedBox(p) {
+    const s = F.skippedByMark(p.notLoaded);
+    if (!s.total) return "";
+    const marks = s.list.map((x) => (x.n > 1 ? `${x.mark} ×${x.n}` : x.mark));
+    return `<div class="warn" id="fabSkipped"><b>${esc(L2(`Пропуснати: ${nAsm(s.total)} – няма да се запишат`, `Skipped: ${nAsm(s.total)} – will not be saved`))}</b><br>
+      ${esc(L2("Не са в заредения етап – заредете етапа, за да ги внесете.", "Not in the loaded stage – load the stage to import them."))}
+      <details${s.list.length <= 20 ? " open" : ""}><summary>${esc(L2(`Списък (${nMark(s.list.length)})`, `List (${nMark(s.list.length)})`))}</summary><div class="sub" style="user-select:text">${esc(marks.join(" · "))}</div></details></div>`;
+  }
+
   function renderFab() {
     const right = can("fab") && !state.fabError;
     const total = state.asms.length;
@@ -1104,14 +1129,14 @@
       const fname = (f) => ({ FabDate: L2("изработен", "fabricated"), DelivDate: L2("доставен", "delivered"), DelivNote: L2("СР", "DN") }[f] || f);
       const show = (f, v) => (f === "DelivNote" ? v : fmtDate(v));
       preview = `<div class="box" style="margin-top:6px"><div><b>${esc(fp.source)}</b></div>
-        <div class="sub">${p.rows} ${L2("реда", "rows")} · ${p.guids} ${L2("сглобки с данни", "assemblies with data")} · ${L2("нови стойности", "new values")} <b>${p.fills}</b> · ${L2("промени на въведени", "changes to stored")} <b>${p.overwrites}</b> · ${L2("без промяна", "unchanged")} ${p.unchanged}</div>
+        ${skippedBox(p)}
+        <div class="sub">${p.rows} ${L2("реда", "rows")} · ${p.guids} ${L2("сглобки с данни", "assemblies with data")} · ${L2("нови стойности", "new values")} <b>${p.fills}</b> · ${L2("промени на въведени", "changes to stored")} <b>${p.overwrites}</b> · ${L2("без промяна", "unchanged")} ${p.unchanged}${p.notLoaded.length ? ` · <b class="bad">${L2("пропуснати", "skipped")} ${p.notLoaded.length}</b>` : ""}</div>
         ${over.length ? `<div class="warn"><b>${esc(L2("Ще се променят вече въведени стойности", "Stored values that will change"))}</b> (${over.length}):<br>${over.slice(0, 15).map((c) => esc(`${c.mark}: ` + c.over.map((o) => `${fname(o.field)} ${show(o.field, o.from)} → ${show(o.field, o.to)}`).join(", "))).join("<br>")}${over.length > 15 ? "<br>…" : ""}</div>` : ""}
         ${list(L2("Неразпознати дати (пропуснати)", "Dates not understood (skipped)"), p.problems)}
         ${list(L2("Проверете (ДД/ММ или ММ/ДД?)", "Check (DD/MM or MM/DD?)"), p.warnings)}
         ${list(L2("Една сглобка с различни стойности", "One assembly with different values"), p.conflicts)}
-        ${list(L2("Не са в заредения модел (не се записват)", "Not in the loaded model (not saved)"), p.notLoaded)}
         ${list(L2("Невалиден GUID", "Invalid GUID"), p.badGuid)}
-        <div class="bar"><button class="small" data-act="fabApply" ${p.changes.length && right ? "" : "disabled"}>${esc(L2(`Запиши (${p.changes.length} сглобки)`, `Save (${p.changes.length} assemblies)`))}</button>
+        <div class="bar"><button class="small" data-act="fabApply" ${p.changes.length && right ? "" : "disabled"}>${esc(L2(`Запиши (${nAsm(p.changes.length)})`, `Save (${nAsm(p.changes.length)})`))}</button>
           <button class="small secondary" data-act="fabCancel">${esc(L2("Откажи", "Cancel"))}</button>${right ? "" : `<span class="sub">${esc(noRight())}</span>`}</div></div>`;
     }
     $("tab-fab").innerHTML = (state.fabError ? `<div class="warn">${esc(L2("Датите за производство не могат да се прочетат: ", "Fabrication dates cannot be read: ") + state.fabError)}</div>` : "") + `<div class="box">
@@ -1120,7 +1145,7 @@
           ${right ? "" : `<span class="sub">${esc(noRight())}</span>`}</div>
         ${legacyBanner()}${noBackupBox()}${lastImportBox()}
         ${isAdmin() && state.sel.length ? `<div class="bar"><button class="small secondary" data-act="clearFab">${esc(clearArmed()
-          ? L2(`Потвърди: изтрий датите на ${state.sel.length} сглобки`, `Confirm: clear the dates of ${state.sel.length} assemblies`)
+          ? L2(`Потвърди: изтрий датите на ${nAsm(state.sel.length)}`, `Confirm: clear the dates of ${nAsm(state.sel.length)}`)
           : L2(`Изтрий датите на избраните (${state.sel.length})`, `Clear the dates of the selected (${state.sel.length})`))}</button></div>` : ""}
         <div class="sub">${esc(L2("Файлът от отчета AM_Fabrication с попълнени оранжеви колони. Сглобките се разпознават по GUID. Празна клетка не изтрива дата. Tekla чете датите като ASSEMBLY.PSET.AM_Fabrication.* след „Synchronize property sets“.",
           "The AM_Fabrication report file with the orange columns filled. Assemblies are matched by GUID. An empty cell never clears a date. Tekla reads the dates as ASSEMBLY.PSET.AM_Fabrication.* after \"Synchronize property sets\"."))}</div></div>${preview}${fabFilesBox(right)}`;
@@ -1132,7 +1157,7 @@
     const n = (state.legacyOnly || []).length;
     if (!n || !office()) return "";   // an admin migration task: not shown to site roles (week 3, A8)
     const any = ["status", "hold", "fab"].some((w) => can(w));
-    return `<div class="warn">${esc(L2(`${n} записа (сглобки с „$“ в GUID) са в стар формат и не се виждат в панела на Connect и в Tekla.`, `${n} records (assemblies with "$" in the GUID) are in the old format and are not shown in Connect's panel or Tekla.`))}
+    return `<div class="warn">${esc(L2(`${nRec(n)} (сглобки с „$“ в GUID) са в стар формат и не се виждат в панела на Connect и в Tekla.`, `${n} records (assemblies with "$" in the GUID) are in the old format and are not shown in Connect's panel or Tekla.`))}
       <div class="bar"><button class="small" data-act="moveLegacy" ${any ? "" : "disabled"}>${esc(L2("Премести", "Move"))}</button></div></div>`;
   }
   function renderMarks(av) {
@@ -1169,7 +1194,7 @@
       + got.map((m) => `<tr><td>${esc(m.mark)}</td><td class="n">${m.typed}</td><td class="n">${m.excel}</td><td class="n${m.differs ? " bad" : ""}">${m.delivered}</td><td class="sub">${esc(srcName(m.source))}</td></tr>`).join("")
       + `</tbody></table></div></div>` : "";
     const pend = state.dlvPending, dd = state.dlvDraft || {};
-    const pendBox = pend ? `<div class="warn"><b>${esc(pend.source)}</b>: ${esc(L2(`${pend.lines.length} марки, ${pend.lines.reduce((n, l) => n + l.qty, 0)} бр.`, `${pend.lines.length} marks, ${pend.lines.reduce((n, l) => n + l.qty, 0)} pcs`))}
+    const pendBox = pend ? `<div class="warn"><b>${esc(pend.source)}</b>: ${esc(L2(`${nMark(pend.lines.length)}, ${pend.lines.reduce((n, l) => n + l.qty, 0)} бр.`, `${nMark(pend.lines.length)}, ${pend.lines.reduce((n, l) => n + l.qty, 0)} pcs`))}
         <div class="sub">${esc(pend.lines.slice(0, 20).map((l) => `${l.mark}×${l.qty}`).join(", "))}${pend.lines.length > 20 ? " …" : ""}</div>
         <div class="sub">${esc(L2("Дата и № на стоковата разписка се вземат от полетата по-долу.", "Date and delivery note no. come from the fields below."))}</div>
         <div class="bar"><button class="small" data-act="dlvPendOk" ${right ? "" : "disabled"}>${esc(L2("Запиши доставката", "Save the delivery"))}</button><button class="small secondary" data-act="dlvPendNo">${esc(L2("Откажи", "Cancel"))}</button></div></div>` : "";
@@ -1440,7 +1465,7 @@
   $("chkFollow").onchange = (e) => { state.follow = e.target.checked; saveView(); };
   $("chkColour").onchange = (e) => guarded(async () => { state.coloured = e.target.checked; saveView(); $("legend").classList.toggle("off", !state.coloured); await applyColours(); });
   $("selLang").value = lang;
-  $("selLang").onchange = (e) => { lang = e.target.value; try { localStorage.setItem("arsten.assemblyStatus.lang", lang); } catch {} render(); };
+  $("selLang").onchange = (e) => { lang = I18N ? I18N.setLang(e.target.value) : e.target.value; render(); if (statusIsLine != null) statusLine(statusIsLine); if (window.ArstenDiag && ArstenDiag.relabel) ArstenDiag.relabel(); };
 
   let loadGen = 0;
   // Audit item 8 (smallest step): the loaded model set {id@versionId} of the last load that finished (records and
@@ -1485,14 +1510,15 @@
   function statusLine(partsDone) {
     if (!partsDone) {
       setStatus(headText() + " · " + (state.partsError ? L2("⚠ частите не са прочетени – презаредете панела", "⚠ the parts could not be read – reload the panel") : partsText()), !!state.partsError);
+      statusIsLine = false;
       return;
     }
     const site = state.bolts.filter((b) => b.sides && (b.sides.others || []).length).length;
     const st = state.loadStats || {};
     const warn = [];
-    if (st.dupAsms || st.dupBolts) warn.push(L2(`заредени два пъти (припокриващи се модели): ${st.dupAsms} сглобки, ${st.dupBolts} болта – броени веднъж`,
+    if (st.dupAsms || st.dupBolts) warn.push(L2(`заредени два пъти (припокриващи се модели): ${nAsm(st.dupAsms)}, ${nW(st.dupBolts, "болт", "болта", "bolt", "bolts")} – броени веднъж`,
       `loaded twice (overlapping models): ${st.dupAsms} assemblies, ${st.dupBolts} bolts – counted once`));
-    if (st.childErrors) warn.push(L2(`${st.childErrors} сглобки без прочетени елементи`, `${st.childErrors} assemblies whose parts could not be read`));
+    if (st.childErrors) warn.push(L2(`${nAsm(st.childErrors)} без прочетени елементи`, `${nAsm(st.childErrors)} whose parts could not be read`));
     if (st.lookupFailed) warn.push(L2(`${st.lookupFailed} основни елемента не можаха да се потърсят – презаредете`, `${st.lookupFailed} main parts could not be looked up – reload`));
     const head = headText();
     if (office()) setStatus(`${head} · ${state.bolts.length} ${L2("болтови групи", "bolt groups")} (${site} ${L2("между две сглобки", "between two assemblies")})`
@@ -1502,6 +1528,7 @@
       const broken = st.childErrors || st.lookupFailed;
       setStatus(head + (broken ? L2(" · ⚠ част от модела не е прочетена – презаредете панела", " · ⚠ part of the model could not be read – reload the panel") : ""), !!broken);
     }
+    statusIsLine = true;
   }
   /** A load's two phases meet here: records in -> the panel is shown; records and parts in -> colours, and the model
    *  set counts as loaded (item 8). Only the newest load settles. */
@@ -1568,10 +1595,13 @@
   }
   async function start(api, client) {
     state.api = api;
+    if (window.ArstenDiag) ArstenDiag.set({ panel: "Стомана (assembly-status)", version: BUILD, lang: () => lang });   // round 19 M1: before the access check, so a denied screen's diagnostics name the panel
     state.access = window.ARSTEN_DEMO ? (window.ARSTEN_DEMO_ACCESS || { allowed: true, role: "admin" }) : await ArstenAccess.check({ api, getToken, app: "assembly" });
+    if (I18N) { lang = await I18N.pickLang(api, state.access, OLD_LANG); $("selLang").value = lang; }   // stored choice, else the Connect user's language
     if (!state.access.allowed) { state.denied = true; state.api = null; ArstenAccess.renderDenied(document.body, lang, state.access); return; }
     state.project = (await api.project.getProject()) || {};
     try { const u = await api.user.getUser(); state.user = [u.firstName, u.lastName].filter(Boolean).join(" ") || u.email || ""; state.userId = u.id || u.email || ""; } catch {}
+    if (window.ArstenDiag) ArstenDiag.set({ panel: "Стомана (assembly-status)", projectId: state.project.id, version: BUILD, redact: [state.user], lang: () => lang });   // A23
     loadView();   // colouring (default on), follow and tab, per user (week 3, A7)
     state.client = client || new A.PsetClient({ region: state.project.location || "europe", getToken });
     render();
@@ -1592,10 +1622,11 @@
   }
   if (window.parent === window) {
     if (/[?&]demo\b/.test(location.search) && /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) { const s = document.createElement("script"); s.src = "demo.js?t=" + Date.now(); document.body.appendChild(s); }
-    else setStatus("Not inside Trimble Connect. Add this extension to a project and open it from the 3D viewer side panel.", true);
+    else setStatus(I18N ? I18N.word("notInside", lang) : "Not inside Trimble Connect.", true);
     return;
   }
+  if (I18N) setStatus(I18N.word("connecting", lang));
   TrimbleConnectWorkspace.connect(window.parent, onEvent, 30000)
     .then((api) => start(api))
-    .catch((e) => setStatus("Could not connect to Trimble Connect: " + errText(e), true));
+    .catch((e) => setStatus((I18N ? I18N.word("connectFail", lang) : "Could not connect to Trimble Connect") + ": " + errText(e), true));
 })();
