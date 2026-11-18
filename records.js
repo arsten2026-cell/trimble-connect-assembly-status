@@ -206,6 +206,70 @@
     return client.replace(libId, def, encLink, props);
   }
 
+  /** Do two copies of a record show the same `kind` flag (flag, date, by, note)? Dates compare by their day, so a
+   *  "2026-11-17" written here equals the "2026-11-17T00:00:00Z" the service may give back; empty = missing = false. */
+  function sameFlag(a, b, kind) {
+    const noteKey = kind === "hold" ? "hold_reason" : `${kind}_note`;
+    const norm = (v) => (v == null || v === false || v === "" ? "" : /^\d{4}-\d{2}-\d{2}/.test(String(v)) ? String(v).slice(0, 10) : String(v));
+    return [kind, `${kind}_date`, `${kind}_by`, noteKey].every((k) => norm((a || {})[k]) === norm((b || {})[k]));
+  }
+  /**
+   * One "Отбележи" / "Отмени" press on one piece, written over the record as it is NOW (sweep 18.11.2026): the panel's
+   * copy is from the last load, so another device may have marked erected / hold since. The record is read fresh
+   * (readOne, with its version), `next` is built from that fresh copy (the other person's other flags, notes and
+   * history stay) and written with the version, so a write in between is refused (412/409) and the piece re-read
+   * once. When this flag itself changed since the panel showed it, nothing is written: status "meanwhile", the
+   * caller tells the user. Undo first lands the cleared flag with the version, only then replaces the whole record
+   * (PATCH can not remove fields), so the replace never re-creates an old copy over someone else's write.
+   * o: {enc, raw (raw-"$" link or null), rawKind ("move" | "merge" | "stale"), shown, kind, on, info(fresh) -> setFlag info}.
+   * client: {readOne, writeIfUnchanged, remove, replace} as PsetClient.
+   * Returns {status: "done" | "meanwhile" | "none" (undo of a flag already removed), rec (what is now stored)}.
+   */
+  async function writeFlag(client, libId, def, o) {
+    for (let attempt = 0; ; attempt++) {
+      const cur = await client.readOne(libId, def, o.enc);
+      let fresh = (cur && cur.props) || null;
+      if (o.raw) {
+        // the same merge as the load (app.js loadRecords): raw only = moved; raw newer = its fields win, history joined
+        const old = await client.readOne(libId, def, o.raw);
+        const op = old && old.props;
+        if (op && !fresh) fresh = op;
+        else if (op && o.rawKind === "merge") fresh = Object.assign({}, fresh, op, { log: [fresh.log, op.log].filter(Boolean).join("\n") });
+      }
+      if (!sameFlag(o.shown, fresh, o.kind)) return { status: "meanwhile", rec: fresh };
+      if (!o.on && !(fresh && fresh[o.kind])) return { status: "none", rec: fresh };
+      const next = setFlag(fresh, o.kind, o.on, o.info ? o.info(fresh) : {});
+      try { await client.writeIfUnchanged(libId, def, o.enc, next, cur ? cur.v : undefined); }
+      catch (e) { if ((e.status === 412 || e.status === 409) && attempt < 1) continue; throw e; }
+      if (!o.on) {
+        // undo over a raw-"$" copy (review 9 M1): the raw copy goes before the replace; a failed delete stops here
+        if (o.raw) await client.remove(libId, def, o.raw);
+        await client.replace(libId, def, o.enc, next);
+      }
+      return { status: "done", rec: next };
+    }
+  }
+
+  /**
+   * "Анулирай" on one delivery, written over the record as it is NOW (sweep 18.11.2026): the panel's copy is from the
+   * last load, so a colleague may have cancelled it or added to its log since. The record is read fresh (readOne, with
+   * its version) and only {cancelled, log} is merged on with that version, so a write in between is refused (412/409)
+   * and re-read once instead of overwritten.
+   * Returns {status: "done" | "meanwhile" (already cancelled by someone) | "gone" (no such record), rec (stored now)}.
+   */
+  async function writeCancel(client, libId, def, link, info) {
+    for (let attempt = 0; ; attempt++) {
+      const cur = await client.readOne(libId, def, link);
+      const fresh = (cur && cur.props) || null;
+      if (!fresh) return { status: "gone", rec: null };
+      if (fresh.cancelled) return { status: "meanwhile", rec: fresh };
+      const next = cancelDelivery(fresh, info);
+      try { await client.writeIfUnchanged(libId, def, link, { cancelled: true, log: next.log }, cur.v); }
+      catch (e) { if ((e.status === 412 || e.status === 409) && attempt < 1) continue; throw e; }
+      return { status: "done", rec: next };
+    }
+  }
+
   /**
    * Requested links missing from a batch-get result while another returned key, not itself requested, decodes to the
    * same GUID: the service echoed the other "$" link form, so the undo file would wrongly record "did not exist"
@@ -219,6 +283,6 @@
     return [...asked].filter((l) => !has(l) && other.has(decode(l)));
   }
 
-  return { LIB_NAMES, DEF, definitions, today, setFlag, deliveryLink, deliveryPrefix, newDelivery, cancelDelivery, parseDeliveryText, linesFromRows,
-    deliveredByMark, availabilityWithFab, fabDelivered, replaceOverRaw, echoMismatch };
+  return { LIB_NAMES, DEF, definitions, today, setFlag, deliveryLink, deliveryPrefix, newDelivery, cancelDelivery, writeCancel, parseDeliveryText, linesFromRows,
+    deliveredByMark, availabilityWithFab, fabDelivered, replaceOverRaw, echoMismatch, sameFlag, writeFlag };
 });

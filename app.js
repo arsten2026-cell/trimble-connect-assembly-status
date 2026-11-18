@@ -50,13 +50,21 @@
   const flash = (text, bad) => { setStatus(text, bad); toast(text, bad); };
   const BUILD = ((document.currentScript && /[?&]v=(\d+)/.exec(document.currentScript.src)) || [])[1] || "dev";
   const errText = (e) => (e && (e.message || e.toString())) || String(e);
-  async function guarded(fn) { try { await fn(); } catch (e) { flash(L2("Грешка: ", "Error: ") + errText(e), true); console.error(e); } }
+  // plain words, not "Грешка: Failed to fetch" / "PATCH …: 412" on a weak site signal (sweep 18.11.2026, as Монолитен
+  // бетон, Дейности, Статус). Стомана has no Обнови button, so friendly's default "reopen the panel" applies. A panel's
+  // own sentence (no status, not technical) is shown as it is; the raw error goes to the console.
+  const plainErr = (e) => (I18N ? I18N.friendly(e, lang) : L2("Грешка: ", "Error: ") + errText(e));
+  async function guarded(fn) { try { await fn(); } catch (e) { console.error(e); flash(plainErr(e), true); } }
   // Writes vs. a model reload (review 10 M3, as Монолитен бетон round 8 M4): a reload waits while writes are in flight,
   // the write buttons are refused while a load runs, and a write that still lands during a load is put back over the
   // load's older read (book.replay in loadRecords), so it never disappears from the screen.
   let inflight = 0;
   const book = L.writeBook();
   async function writing(fn) { inflight++; try { return await fn(); } finally { inflight--; } }
+  // One write at a time (sweep 18.11.2026): a second tap while a write runs is ignored, the write buttons show
+  // "Записване…" disabled (a double tap on „Запиши доставка“ used to save the same note twice). gate.busy = the action.
+  const gate = L.singleFlight();
+  const SAVING = () => L2("Записване…", "Saving…");
   /** A record just written: into the live map (never one captured before an await) and into the book. */
   function keepRec(field, guid, rec) {
     if (rec == null) state[field].delete(guid); else state[field].set(guid, rec);
@@ -75,7 +83,8 @@
     fab: new Map(), fabPlan: null,   // fabrication dates per IFC GUID (fabrication.js); the import waiting for "Save"
     sel: [], coloured: true, tab: "marks", boltScope: "all", follow: true,   // colouring on by default, remembered per user (week 3, A7)
     markFilter: "",   // search above the Марки table (A5)
-    fabFiles: { list: [], loading: false, error: "", missing: false, at: 0, busy: null },   // _AM_Docs/Fabrication (B-Office 1)
+    fabFiles: { list: [], loading: false, error: "", missing: false, complete: true, at: 0, busy: null },   // _AM_Docs/Fabrication (B-Office 1)
+    cancelling: null, cancelReason: "",   // the delivery link whose reason box is open, and the typed reason (sweep 18.11.2026)
     drafts: {}, flagArmed: null, dlvPending: null,   // typed date/note per card kept across selection changes (F6); big-write confirm (F1); delivery file waiting for "Запиши" (F7)
     noBackupAsk: null, noBackupOk: null,   // failed undo file before fab-clear / Премести: the inline question, and the action confirmed without one (review 9 M5)
   };
@@ -151,17 +160,24 @@
   // allObjects: the last finished load's list (shown in the "no assemblies" diagnostics). Each load reads into its own
   // ctx.all, so two overlapping loads never share or reset one list (review round 3, M3).
   let allObjects = null;
+  // VIEWER_POOL viewer calls at once (sweep 18.11.2026): chunks were read one after the other; 4 as viewer-project-status.
+  const VIEWER_POOL = 4;
   async function readAll(ctx) {
     if (ctx.all) return ctx.all;
-    const api = state.api, all = [];
-    for (const m of (await api.viewer.getObjects()) || []) {
-      const ids = (m.objects || []).map((o) => o.id);
-      for (let i = 0; i < ids.length; i += BATCH) {
-        if (ctx.stale()) return all;
-        for (const p of (await api.viewer.getObjectProperties(m.modelId, ids.slice(i, i + BATCH))) || []) all.push({ modelId: m.modelId, id: p.id, cls: String(p.class || "") });
-        setStatus(L2(`Чета модела… ${Math.min(i + BATCH, ids.length)} от ${ids.length}`, `Reading the model… ${Math.min(i + BATCH, ids.length)} of ${ids.length}`));
-      }
-    }
+    const api = state.api;
+    const models = ((await api.viewer.getObjects()) || []).map((m) => ({ modelId: m.modelId, ids: (m.objects || []).map((o) => o.id) }));
+    const jobs = L.classChunks(models, BATCH);
+    const total = models.reduce((n, m) => n + m.ids.length, 0);
+    let read = 0;
+    const got = await A.mapLimit(jobs, VIEWER_POOL, async (j) => {
+      if (ctx.stale()) return [];
+      const ps = (await api.viewer.getObjectProperties(j.modelId, j.ids)) || [];
+      read += j.ids.length;
+      setStatus(L2(`Чета модела… ${read} от ${total}`, `Reading the model… ${read} of ${total}`));
+      return ps.map((p) => ({ modelId: j.modelId, id: p.id, cls: String(p.class || "") }));
+    }, { retries: 0 });
+    const all = [].concat(...got);
+    if (ctx.stale()) return all;
     ctx.all = all;
     return all;
   }
@@ -175,35 +191,48 @@
     const byModel = new Map();
     for (const o of await readAll(ctx)) if (re.test(o.cls)) { if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(o.id); }
     if (!byModel.size && /elementassembly/i.test(cls)) {
-      // assemblies as parents of the parts (as in Cast unit tags)
-      const all = (await readAll(ctx)).filter((o) => !/elementassembly/i.test(o.cls));
-      const seen = new Set();
-      let done = 0;
-      await pool(all, 8, async (o) => {
-        if (ctx.stale()) return;
-        try {
-          const ps = (await api.viewer.getHierarchyParents(o.modelId, [o.id], ELEMENT_ASSEMBLY)) || [];
-          for (const p of ps) { const k = key(o.modelId, p.id); if (!seen.has(k)) { seen.add(k); if (!byModel.has(o.modelId)) byModel.set(o.modelId, []); byModel.get(o.modelId).push(p.id); } }
-        } catch {}
-        if (++done % 100 === 0) setStatus(L2(`Търся сглобките… ${done} от ${all.length}`, `Finding assemblies… ${done} of ${all.length}`));
-      });
+      // assemblies as parents of the parts (as in Cast unit tags). Per model, parents asked for 200 ids at a time
+      // (4 at once) and only the ids their children do not cover one by one (sweep 18.11.2026, steel.js findParents;
+      // was one getHierarchyParents call per object of every loaded model). The children read here go into ctx.kids,
+      // so loadParts does not ask for them again.
+      const perModel = new Map();
+      for (const o of await readAll(ctx)) {
+        if (/elementassembly/i.test(o.cls)) continue;
+        if (!perModel.has(o.modelId)) perModel.set(o.modelId, []);
+        perModel.get(o.modelId).push(o.id);
+      }
+      const total = [...perModel.values()].reduce((n, ids) => n + ids.length, 0);
+      let found = 0;
+      setStatus(L2(`Търся сглобките… ${total} обекта`, `Finding assemblies… ${total} objects`));
+      for (const [modelId, ids] of perModel) {
+        if (ctx.stale()) break;
+        const r = await L.findParents(ids,
+          (chunk) => api.viewer.getHierarchyParents(modelId, chunk, ELEMENT_ASSEMBLY),
+          async (pid) => ((await api.viewer.getHierarchyChildren(modelId, [pid], ELEMENT_ASSEMBLY)) || []).map((c) => c.id),
+          { pool: 4, stale: ctx.stale });
+        if (r.parents.length) byModel.set(modelId, r.parents);
+        for (const [pid, kids] of r.kids) if (kids.length) ctx.kids.set(key(modelId, pid), kids);
+        found += r.parents.length;
+        console.info(`[Стомана] assemblies as hierarchy parents: ${r.parents.length} in model ${modelId} with ${r.calls} viewer calls for ${ids.length} objects`);
+        setStatus(L2(`Търся сглобките… намерени ${found}`, `Finding assemblies… ${found} found`));
+      }
     }
     return [...byModel].map(([modelId, ids]) => ({ modelId, ids }));
   }
 
   async function readClass(cls, psetRe, ctx) {
-    const api = state.api, out = [];
-    for (const m of await idsOfClass(cls, ctx)) {
-      const ids = m.ids;
-      for (let i = 0; i < ids.length; i += BATCH) {
-        if (ctx.stale()) return [];
-        const chunk = ids.slice(i, i + BATCH);
-        const props = (await api.viewer.getObjectProperties(m.modelId, chunk)) || [];
-        const guids = (await api.viewer.convertToObjectIds(m.modelId, chunk)) || [];
-        props.forEach((p, k) => { const ps = psetOf(p, psetRe); out.push({ modelId: m.modelId, id: p.id, guid: guids[k] || null, ps: ps || {} }); });
-      }
-    }
-    return out.filter((o) => o.guid);
+    const api = state.api;
+    const jobs = L.classChunks(await idsOfClass(cls, ctx), BATCH);
+    if (ctx.stale()) return [];
+    // properties and GUIDs of a chunk side by side, VIEWER_POOL chunks at once; results in model + chunk order
+    // (sweep 18.11.2026: were two serial calls per chunk - 4 000 bolts = 40 calls one after the other)
+    const got = await A.mapLimit(jobs, VIEWER_POOL, async (j) => {
+      if (ctx.stale()) return [];
+      const [props, guids] = await Promise.all([api.viewer.getObjectProperties(j.modelId, j.ids), api.viewer.convertToObjectIds(j.modelId, j.ids)]);
+      return (props || []).map((p, k) => ({ modelId: j.modelId, id: p.id, guid: (guids || [])[k] || null, ps: psetOf(p, psetRe) || {} }));
+    }, { retries: 0 });
+    if (ctx.stale()) return [];
+    return [].concat(...got).filter((o) => o.guid);
   }
   async function parentAssembly(modelId, id, byKey) {
     const ps = (await state.api.viewer.getHierarchyParents(modelId, [id], ELEMENT_ASSEMBLY)) || [];
@@ -305,7 +334,9 @@
         const sig = L.modelSig(versions.get(a.modelId), asms.filter((x) => x.modelId === a.modelId));
         nextKids.set(a.modelId, { sig, kids: new Map(), old: childCache.take(a.modelId, sig) });
       }
-      const e = nextKids.get(a.modelId), c = e.old && e.old.get(a.id);
+      const e = nextKids.get(a.modelId);
+      // from the session cache, or from the hierarchy-parent fallback of this load (idsOfClass, sweep 18.11.2026)
+      const c = (e.old && e.old.get(a.id)) || (ctx.kids && ctx.kids.get(key(a.modelId, a.id)));
       if (c) { partsOf.set(a, c.slice()); e.kids.set(a.id, c); } else todoA.push(a);
     }
     let doneA = 0, childErrors = 0;
@@ -413,25 +444,34 @@
     state.partsReady = true;
     return true;
   }
+  // VIEWER_POOL assemblies at once, results in assembly order (sweep 18.11.2026: were one call after the other)
   async function assemblyBoxes(asms, partsOf) {
-    const out = [];
-    for (const a of asms) {
+    return A.mapLimit(asms, VIEWER_POOL, async (a) => {
       const parts = partsOf.get(a) || [];
       let boxes = [];
       try { boxes = ((await state.api.viewer.getObjectBoundingBoxes(a.modelId, parts.length ? parts : [a.id])) || []).map((x) => x.boundingBox).filter(Boolean); } catch {}
-      out.push({ guid: a.guid, mark: a.mark, boxes });
-    }
-    return out;
+      return { guid: a.guid, mark: a.mark, boxes };
+    }, { retries: 0 });
   }
 
   // ---------- library ----------
   /** Statuses, holds and deliveries of the loaded assemblies. Read into locals; assigned only when this is still the
    *  newest load, so a slow older load cannot overwrite the newer load's statuses (review round 3, M1). Without gen
    *  (after a save) it always assigns. */
-  async function loadRecords(gen) {
+  /** The GUID-free part of the record read (library, definitions, deliveries list), see L.prepRecords. With its write
+   *  mark taken BEFORE the deliveries list starts, so a write landing meanwhile is replayed (M3). */
+  function startRecords() {
+    const since = book.mark();
+    return { since, p: L.prepRecords(state.client, { projectId: state.project.id, names: R.LIB_NAMES, defs: R.definitions(),
+      fabDef: F.definition(), delDef: R.DEF.delivery, delPrefix: R.deliveryPrefix(state.project.id) }) };
+  }
+  /** pre: a startRecords() begun earlier (loadPhaseA starts it beside the viewer scan, sweep 18.11.2026); without it
+   *  (after a save) it is started here. */
+  async function loadRecords(gen, pre) {
     const current = () => gen === undefined || gen === loadGen;
-    const since = book.mark();   // writes landing after this may be missing from the reads below (M3)
-    const found = await state.client.findLibrary(state.project.id, R.LIB_NAMES);
+    const { since, p } = pre || startRecords();   // writes landing after `since` may be missing from the reads below (M3)
+    const prep = await p;
+    const found = prep.found;
     if (!current()) return false;
     if (!found.lib) {
       state.lib = null;
@@ -444,10 +484,10 @@
     }
     $("setupBox").hidden = true;
     state.lib = found.lib;
-    for (const d of R.definitions()) {
-      try { await state.client.ensureDefinition(state.lib.id, d); }
-      catch (e) { if (e.status !== 403) throw e; }   // non-admins cannot create definitions; reading still works
-    }
+    // all definitions side by side (sweep 18.11.2026; were 4 serial calls). Non-admins cannot create definitions (403,
+    // ignored; reading still works). Fabrication dates: an admin's first visit creates the definition; until then there
+    // is nothing to read. Any error of it only disables the Производство tab, never the rest of Стомана (round 5, M3)
+    let fabFail = prep.fabFail;   // definitions already ensured in startRecords
     const links = state.asms.map((a) => entLink(a.guid));
     const legacy = state.asms.filter((a) => hasLegacy(a.guid)).map((a) => legacyLink(a.guid));
     const toMap = (m) => new Map([...m].map(([l, p]) => [guidOfLink(l), p]));
@@ -465,10 +505,6 @@
       }
       return out;
     };
-    // fabrication dates: an admin's first visit creates the definition; until then there is nothing to read. Any
-    // error here only disables the Производство tab, never the rest of Стомана (round 5, M3)
-    let fabFail = null;
-    try { await state.client.ensureDefinition(state.lib.id, F.definition()); } catch (e) { if (e.status !== 403) fabFail = e; }
     // status, hold and fabrication, each under the encoded and (for "$" GUIDs) the raw legacy link: every 100-link call
     // of all of them at most RECORD_POOL at once, with retry on 429/503 (speed audit item 1; were one after the other).
     // The deliveries are listed at the same time. A status / hold error fails the load as before; a fabrication error
@@ -484,7 +520,7 @@
         if (!j.soft) return readJob(j);
         try { return await readJob(j); } catch (e) { if (!fabFail) fabFail = e; return null; }
       }, { retries: 0 }),
-      state.client.listAll(state.lib.id, R.DEF.delivery, R.deliveryPrefix(state.project.id)),
+      prep.dels,   // started in startRecords, right after the definitions
     ]);
     console.info(`[Стомана] records: ${jobs.length} batch-get calls (pool ${RECORD_POOL}) + deliveries in ${Date.now() - t0} ms`);
     const res = L.joinReads(reads, jobs, got).map(toMap);
@@ -623,34 +659,35 @@
     // more than BIG pieces (the confirmed path): undo file first
     const bak = targets.length > BIG ? await backupFirst(`${kind}-${on ? (correcting ? "correct" : "set") : "undo"}`, linksOf(def, targets.map((a) => a.guid))) : "";
     let done = 0, failed = 0, first = "";
+    const meanwhile = [];
+    // Each piece is read fresh and written with its version (R.writeFlag, sweep 18.11.2026): another device's erected /
+    // hold mark made after this panel loaded is never overwritten by our older copy, and an undo never re-creates it.
     await pool(targets, 6, async (a) => {
-      const cur = state[field].get(a.guid) || null;
-      if (!on && !(cur && cur[kind])) return;
-      let info = { date, note, by: state.user, mark: a.mark };
-      if (correcting && cur) {
-        const ownDate = cur[`${kind}_date`] || date;
+      const shown = state[field].get(a.guid) || null;
+      if (!on && !(shown && shown[kind])) return;
+      const raw = hasRaw(def, a.guid);
+      const rawRow = raw ? (state.legacyOnly || []).find((r) => r.def === def && r.guid === a.guid) : null;
+      const info = (fresh) => {
+        if (!(correcting && fresh)) return { date, note, by: state.user, mark: a.mark };
+        const ownDate = fresh[`${kind}_date`] ? String(fresh[`${kind}_date`]).slice(0, 10) : date;
         const newDate = typedDate && typedDate !== ownDate ? typedDate : ownDate;
-        info = { date: newDate, note: note || cur[noteKey] || "", by: newDate !== ownDate ? state.user : cur[`${kind}_by`] || state.user, mark: a.mark };
-      }
-      const next = R.setFlag(cur, kind, on, info);
+        return { date: newDate, note: note || fresh[noteKey] || "", by: newDate !== ownDate ? state.user : fresh[`${kind}_by`] || state.user, mark: a.mark };
+      };
       try {
-        if (!on && hasRaw(def, a.guid)) {
-          // undo over a raw-"$" copy (review 9 M1): full record to the encoded link, raw copy deleted, then the replace
-          await R.replaceOverRaw(state.client, state.lib.id, def, entLink(a.guid), legacyLink(a.guid), next);
-          state.legacyOnly = state.legacyOnly.filter((r) => !(r.def === def && r.guid === a.guid));
-          keepRec(field, a.guid, next); done++;
-        } else {
-          await (on ? state.client.write : state.client.replace).call(state.client, state.lib.id, def, entLink(a.guid), next);
-          keepRec(field, a.guid, next); done++;
-          await dropLegacy(def, a.guid);
-        }
+        const r = await R.writeFlag(state.client, state.lib.id, def, { enc: entLink(a.guid), raw: raw ? legacyLink(a.guid) : null, rawKind: rawRow && rawRow.kind, shown, kind, on, info });
+        keepRec(field, a.guid, r.rec);   // what is stored now: ours, or the other person's newer copy
+        if (r.status !== "done") { meanwhile.push(a.mark || a.guid); return; }
+        done++;
+        if (raw && !on) state.legacyOnly = state.legacyOnly.filter((x) => !(x.def === def && x.guid === a.guid));
+        else await dropLegacy(def, a.guid);
       } catch (e) { failed++; if (!first) first = e.status === 403 ? noRight() : errText(e); }
     });
     if (done && !failed) delete state.drafts[kind];
     const skipped = on ? state.sel.length - targets.length : 0;
     flash(`${t(kind)}: ${on ? L2("записано", "saved") : L2("премахнато", "removed")} ${done}`
       + (skipped ? ` · ${skipped} ${L2("вече отбелязани – не са променени", "already marked – left as they were")}` : "")
-      + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "") + bak, failed > 0);
+      + (meanwhile.length ? ` · ${meanwhile.length} ${L2("променени междувременно от друг – не са пипани, вижте ги пак", "changed by someone else meanwhile – left as they are, check them again")}: ${meanwhile.slice(0, 10).join(", ")}` : "")
+      + (failed ? ` · ${failed} ${L2("грешки", "failed")} (${first})` : "") + bak, failed > 0 || meanwhile.length > 0);
     render();
     if (state.coloured) await applyColours();
   }
@@ -668,24 +705,36 @@
     const known = new Set(state.asms.map((a) => L.normMark(a.mark)));
     const unknown = lines.filter((l) => !known.has(l.mark)).map((l) => l.mark);
     flash(L2(`Доставката е записана (${nMark(lines.length)})`, `Delivery saved (${nMark(lines.length)})`) + (unknown.length ? ` · ${L2("няма в модела", "not in the model")}: ${unknown.join(", ")}` : ""), unknown.length > 0);
-    $("dlvText").value = ""; $("dlvNo").value = ""; state.dlvDraft = null;
+    // the saved text is cleared (the gate stops a second tap meanwhile, so the same note can not be posted twice)
+    if ($("dlvText")) $("dlvText").value = ""; if ($("dlvNo")) $("dlvNo").value = ""; state.dlvDraft = null;
     render();
     if (state.coloured) await applyColours();
   }
-  async function cancelDelivery(i) {
+  // Cancelling is keyed by the record's link, not its row (sweep 18.11.2026): a reload re-sorts state.deliveries, and
+  // a colleague's new note sorting in above used to move the open reason box onto a different delivery, which
+  // „Анулирай“ then cancelled. The typed reason lives in state.cancelReason, so a re-render keeps it.
+  function openCancel(link) {
     if (!can("status")) return setStatus(noRight(), true);
-    const d = state.deliveries[i];
     // inline reason box in the row (window.prompt is unreliable inside the Connect iframe)
-    if (state.cancelling !== i) { state.cancelling = i; render(); const r = $("dlvReason"); if (r) r.focus(); return; }
-    const reason = (($("dlvReason") || {}).value || "").trim();
+    state.cancelling = link; state.cancelReason = "";
+    render();
+    const r = $("dlvReason"); if (r) r.focus();
+  }
+  async function cancelDelivery(link) {
+    if (!can("status")) return setStatus(noRight(), true);
+    if (!link || state.cancelling !== link) return openCancel(link);
+    const reason = (state.cancelReason || "").trim();
     if (!reason) return setStatus(L2("Въведете причина за анулиране.", "Enter a reason for cancelling."), true);
-    state.cancelling = null;
-    const next = R.cancelDelivery(d, { by: state.user, note: reason });
-    const { link, ...props } = next;
-    await state.client.write(state.lib.id, R.DEF.delivery, d.link, props);
-    const j = state.deliveries.findIndex((x) => x.link === d.link);   // the live list (a load may have replaced it)
-    if (j >= 0) state.deliveries[j] = next; else state.deliveries.unshift(next);
-    book.add("deliveries", d.link, next);
+    // read fresh and write with the version (R.writeCancel): a cancel or log line added meanwhile is never overwritten
+    const r = await R.writeCancel(state.client, state.lib.id, R.DEF.delivery, link, { by: state.user, note: reason });
+    state.cancelling = null; state.cancelReason = "";
+    const next = r.rec ? Object.assign({ link }, r.rec) : null;
+    const j = state.deliveries.findIndex((x) => x.link === link);   // the live list (a load may have replaced it)
+    if (!next) { if (j >= 0) state.deliveries.splice(j, 1); }
+    else if (j >= 0) state.deliveries[j] = next; else state.deliveries.unshift(next);
+    book.add("deliveries", link, next);
+    if (r.status === "meanwhile") flash(L2("Доставката вече е анулирана от друг – нищо не е променено.", "The delivery was already cancelled by someone else – nothing was changed."), true);
+    else if (r.status === "gone") flash(L2("Доставката вече я няма – нищо не е променено.", "The delivery no longer exists – nothing was changed."), true);
     render();
     if (state.coloured) await applyColours();
   }
@@ -945,43 +994,21 @@
   // Read only: lists _AM_Docs/Fabrication and its subfolders (Core 2.0, the same client as the undo files), never
   // creates a folder. "Внеси" downloads the file (files/fs/{id}/downloadurl) and runs the same preview as a picked file;
   // the import keeps its preview, "Запиши" and undo file.
-  // The project's tool folder is _AM_Docs (renamed from _ArstenDocs on 17.11.2026, one name for Arsten and Multiplan).
-  // Lookups take _AM_Docs first and fall back to an old _ArstenDocs; only _AM_Docs is ever created.
-  const DOCS = "_AM_Docs", DOCS_OLD = "_ArstenDocs";
-  const pickFolder = (list, name, same) => {
-    const eq = same || ((a, b) => a === b);
-    const isF = (x) => !!x && String(x.type || "").toUpperCase() === "FOLDER";
-    return (list || []).find((x) => isF(x) && eq(x.name, name)) || (name === DOCS ? (list || []).find((x) => isF(x) && eq(x.name, DOCS_OLD)) : undefined);
-  };
-  const FAB_FOLDER = [DOCS, "Fabrication"];
-  const itemsOf = (it) => (Array.isArray(it) ? it : (it && it.items) || []);
-  const isFolder = (x) => String((x && x.type) || "").toUpperCase() === "FOLDER";
+  // The project's tool folder is _AM_Docs (renamed from _ArstenDocs on 17.11.2026, one name for Arsten and Multiplan);
+  // ArstenBackup.findFolder takes _AM_Docs first and falls back to an old _ArstenDocs. Nothing is ever created here.
+  // Sweep 18.11.2026: the walk is SteelLogic.listFabEntries (every page of every listing, by_path for a folder Connect
+  // leaves out of a parent closed to the user); before, only page 1 was read and long listings said "folder missing".
   async function listFabFiles() {
-    const core = coreFor();
-    const p = await core.req(`projects/${encodeURIComponent(state.project.id)}`);
-    let id = p && p.rootId;
-    if (!id) throw new Error(L2("основната папка на проекта не е намерена", "project root folder not found"));
-    for (const name of FAB_FOLDER) {
-      const f = pickFolder(itemsOf(await core.req(`folders/${encodeURIComponent(id)}/items`)), name, (a, b) => String(a).toLowerCase() === b.toLowerCase());
-      if (!f) return { missing: true, files: [] };
-      id = f.id;
-    }
-    const entries = [];
-    const walk = async (fid, path, depth) => {
-      for (const x of itemsOf(await core.req(`folders/${encodeURIComponent(fid)}/items`))) {
-        if (isFolder(x)) { if (depth < 4 && entries.length < 500) await walk(x.id, path ? `${path}/${x.name}` : x.name, depth + 1); }
-        else entries.push({ item: x, path });
-      }
-    };
-    await walk(id, "", 0);
-    return { missing: false, files: L.fabFiles(entries) };
+    if (!window.ArstenBackup) throw new Error(L2("модулът arsten-backup.js не е зареден. Презаредете панела.", "the module arsten-backup.js is not loaded. Reload the panel."));
+    const r = await L.listFabEntries(ArstenBackup, coreFor(), state.project.id);
+    return { missing: r.missing, complete: r.complete, files: L.fabFiles(r.entries) };
   }
   async function refreshFabFiles() {
     const ff = state.fabFiles;
     if (ff.loading) return;
     ff.loading = true; ff.error = "";
-    try { const r = await listFabFiles(); ff.list = r.files; ff.missing = r.missing; }
-    catch (e) { ff.list = []; ff.error = e.status === 403 ? L2("нямате достъп до папката", "no access to the folder") : errText(e); console.warn("fabricator files", e); }
+    try { const r = await listFabFiles(); ff.list = r.files; ff.missing = r.missing; ff.complete = r.complete !== false; }
+    catch (e) { ff.list = []; ff.complete = true; ff.error = e.status === 403 ? L2("нямате достъп до папката", "no access to the folder") : errText(e); console.warn("fabricator files", e); }
     finally { ff.loading = false; ff.at = Date.now(); }
     if (state.tab === "fab") render();
   }
@@ -1027,11 +1054,13 @@
     }).join("");
     const body = ff.loading || !ff.at ? `<div class="sub">${esc(L2("Чета папката…", "Reading the folder…"))}</div>`
       : ff.error ? `<div class="warn">${esc(L2("Папката не може да се прочете: ", "The folder cannot be read: ") + ff.error)}</div>`
+      : ff.missing && !ff.complete ? `<div class="warn">${esc(L2("Папката _AM_Docs/Fabrication не е намерена – списъкът на Connect е непълен. Натиснете „Обнови“.", "The folder _AM_Docs/Fabrication was not found – the Connect list is incomplete. Press \"Refresh\"."))}</div>`
       : ff.missing ? `<div class="sub">${esc(L2("Папката _AM_Docs/Fabrication още не съществува в проекта.", "The folder _AM_Docs/Fabrication does not exist in the project yet."))}</div>`
       : !ff.list.length ? `<div class="sub">${esc(L2("Няма файлове .xlsx / .xls в папката.", "No .xlsx / .xls files in the folder."))}</div>`
       : `<div class="scroll"><table><thead><tr><th>${esc(L2("Файл", "File"))}</th><th>${esc(L2("Качен", "Uploaded"))}</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
     return `<div class="box" style="margin-top:6px"><div class="bar" style="margin-top:0"><b>${esc(L2("Файлове от производителя", "Files from the fabricator"))}</b>
       <span class="sub">_AM_Docs/Fabrication</span><button class="small secondary" data-act="fabFilesRefresh" style="margin-left:auto" ${ff.loading ? "disabled" : ""}>${esc(L2("Обнови", "Refresh"))}</button></div>${body}
+      ${ff.at && !ff.loading && !ff.error && !ff.missing && !ff.complete ? `<div class="warn">${esc(L2("Списъкът е непълен – Connect не върна всички файлове. Натиснете „Обнови“.", "The list is incomplete – Connect did not return every file. Press \"Refresh\"."))}</div>` : ""}
       ${state.fabPlan && ff.list.length ? `<div class="sub">${esc(L2("Първо запишете или откажете прегледания импорт.", "First save or cancel the import being previewed."))}</div>` : ""}</div>`;
   }
 
@@ -1093,8 +1122,8 @@
       <div class="row">${kind === "erected" || kind === "hold" ? `<input type="date" id="d_${kind}" max="${R.today()}" value="${esc(dateVal)}"><span class="sub" id="h_${kind}" ${dr.date != null && oldDate(dr.date) ? "" : "hidden"}>${esc(L2("проверете датата", "check the date"))}</span>` : ""}<input type="text" id="n_${kind}" value="${esc(noteVal)}" placeholder="${esc(mixed ? L2("различни – празно = без промяна", "differ – empty = unchanged") : noteLbl + (needNote ? " *" : ""))}"></div>
       ${on.correcting && sel.length ? `<div class="sub">${esc(L2("Всички избрани вече са отбелязани. „Поправи“ записва само това, което промените; празно поле = всяка сглобка запазва своето.", "All selected are already marked. \"Correct\" writes only what you change; an empty box = each keeps its own."))}</div>`
         : sel.length && on.list.length < sel.length ? `<div class="sub">${esc(L2(`${sel.length - on.list.length} вече отбелязани остават както са.`, `${sel.length - on.list.length} already marked stay as they are.`))}</div>` : ""}
-      <div class="row"><button class="small" data-act="on" data-kind="${kind}" ${on.list.length && right ? "" : "disabled"}>${esc(onLbl)}</button>
-        <button class="small secondary undo" data-act="off" data-kind="${kind}" ${off.list.length && right ? "" : "disabled"}>${esc(offLbl)}</button>
+      <div class="row"><button class="small" data-act="on" data-kind="${kind}" ${on.list.length && right && !gate.busy ? "" : "disabled"}>${esc(gate.busy === "on:" + kind ? SAVING() : onLbl)}</button>
+        <button class="small secondary undo" data-act="off" data-kind="${kind}" ${off.list.length && right && !gate.busy ? "" : "disabled"}>${esc(gate.busy === "off:" + kind ? SAVING() : offLbl)}</button>
         ${right ? "" : `<span class="sub">${esc(noRight())}</span>`}</div></div>`;
     };
     const colourOf = (id) => (L.STATES.find((s) => s.id === id) || {}).colour;
@@ -1149,7 +1178,7 @@
     }
     $("tab-fab").innerHTML = (state.fabError ? `<div class="warn">${esc(L2("Датите за производство не могат да се прочетат: ", "Fabrication dates cannot be read: ") + state.fabError)}</div>` : "") + `<div class="box">
         <div>${L2("Изработени", "Fabricated")}: <b>${fabN}</b> · ${L2("Доставени", "Delivered")}: <b>${delN}</b> / ${total}</div>
-        <div class="bar"><label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel от производителя", "Import the fabricator's Excel")}<input type="file" id="fabFile" accept=".xlsx,.xls,.htm,.html" hidden></label>
+        <div class="bar"><label class="small secondary filebtn" style="${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel от производителя", "Import the fabricator's Excel")}<input type="file" id="fabFile" accept=".xlsx,.xls,.htm,.html" hidden></label>
           ${right ? "" : `<span class="sub">${esc(noRight())}</span>`}</div>
         ${legacyBanner()}${noBackupBox()}${lastImportBox()}
         ${isAdmin() && state.sel.length ? `<div class="bar"><button class="small secondary" data-act="clearFab">${esc(clearArmed()
@@ -1175,7 +1204,10 @@
       + (av.unknownDeliveredMarks.length ? `<div class="warn">${esc(L2("Доставени марки, които ги няма в модела: ", "Delivered marks not in the model: "))}${esc(av.unknownDeliveredMarks.join(", "))}</div>` : "")
       // search box (week 3, A5): filters the rows below without re-rendering itself, so typing keeps the focus
       + `<div class="search"><input type="search" id="markFilter" value="${esc(state.markFilter)}" placeholder="${esc(L2("Търси марка: RF, RF22, 22…", "Find a mark: RF, RF22, 22…"))}" autocomplete="off" enterkeyhint="search"><span id="markCount" class="sub"></span></div>`
-      + `<div class="scroll"><table><thead><tr><th>${L2("Марка", "Mark")}</th><th class="n">${L2("Бр.", "Qty")}</th><th class="n">${L2("Дост.", "Deliv.")}</th><th class="n">${L2("Монт.", "Erect.")}</th><th class="n" title="${esc(L2("доставени − монтирани", "delivered − erected"))}">${L2("Налични", "Available")}</th><th class="n">${L2("Не дост.", "Not del.")}</th></tr></thead><tbody id="markRows"></tbody></table></div>`;
+      + `<div class="scroll"><table><thead><tr><th>${L2("Марка", "Mark")}</th><th class="n">${L2("Бр.", "Qty")}</th><th class="n">${L2("Дост.", "Deliv.")}</th><th class="n">${L2("Монт.", "Erect.")}</th><th class="n" title="${esc(L2("Готови за монтаж = доставени, още не монтирани", "Ready to erect = delivered, not erected yet"))}">${L2("Готови", "Ready")}</th><th class="n">${L2("Не дост.", "Not del.")}</th></tr></thead><tbody id="markRows"></tbody></table></div>`
+      // one term for "delivered, not erected yet" (sweep 18.11.2026): the column, the colour legend and the Excel all
+      // say "Готови за монтаж"; a visible line because phones can not show the header's hover title
+      + `<div class="sub">${esc(L2("Готови = доставени, още не монтирани (готови за монтаж).", "Ready = delivered, not erected yet (ready to erect)."))}</div>`;
     // a selection click changes nothing in this tab: the same HTML is not parsed again, so the table, its scroll
     // position and the search box (focus, caret; A5) stay as they are (speed audit item 15)
     const box = $("tab-marks");
@@ -1205,20 +1237,20 @@
     const pendBox = pend ? `<div class="warn"><b>${esc(pend.source)}</b>: ${esc(L2(`${nMark(pend.lines.length)}, ${pend.lines.reduce((n, l) => n + l.qty, 0)} бр.`, `${nMark(pend.lines.length)}, ${pend.lines.reduce((n, l) => n + l.qty, 0)} pcs`))}
         <div class="sub">${esc(pend.lines.slice(0, 20).map((l) => `${l.mark}×${l.qty}`).join(", "))}${pend.lines.length > 20 ? " …" : ""}</div>
         <div class="sub">${esc(L2("Дата и № на стоковата разписка се вземат от полетата по-долу.", "Date and delivery note no. come from the fields below."))}</div>
-        <div class="bar"><button class="small" data-act="dlvPendOk" ${right ? "" : "disabled"}>${esc(L2("Запиши доставката", "Save the delivery"))}</button><button class="small secondary" data-act="dlvPendNo">${esc(L2("Откажи", "Cancel"))}</button></div></div>` : "";
+        <div class="bar"><button class="small" data-act="dlvPendOk" ${right && !gate.busy ? "" : "disabled"}>${esc(gate.busy === "dlvPendOk" ? SAVING() : L2("Запиши доставката", "Save the delivery"))}</button><button class="small secondary" data-act="dlvPendNo">${esc(L2("Откажи", "Cancel"))}</button></div></div>` : "";
     $("tab-deliveries").innerHTML = pendBox + differsWarn(av) + `<div class="box">
         <div class="bar"><input type="date" id="dlvDate" max="${R.today()}" value="${esc(dd.dlvDate != null ? dd.dlvDate : R.today())}"><input type="text" id="dlvNo" value="${esc(dd.dlvNo || "")}" placeholder="${esc(L2("Стокова разписка №", "Delivery note no."))}"></div>
         <textarea id="dlvText" placeholder="${esc(L2("Марка и брой на ред, напр.\nRF22 3\nCL22 2", "Mark and qty per line, e.g.\nRF22 3\nCL22 2"))}">${esc(dd.dlvText || "")}</textarea>
-        <div class="bar"><button class="small" data-act="dlvAdd" ${right ? "" : "disabled"}>${L2("Запиши доставка", "Save delivery")}</button>
-          <label class="small secondary" style="border:1px solid var(--line);padding:2px 7px;font-size:12px;cursor:pointer;${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel/CSV", "Import Excel/CSV")}<input type="file" id="dlvFile" accept=".xlsx,.csv,.txt" hidden></label>
+        <div class="bar"><button class="small" data-act="dlvAdd" ${right && !gate.busy ? "" : "disabled"}>${esc(gate.busy === "dlvAdd" ? SAVING() : L2("Запиши доставка", "Save delivery"))}</button>
+          <label class="small secondary filebtn" style="${right ? "" : "opacity:.45;pointer-events:none"}">${L2("Импорт Excel/CSV", "Import Excel/CSV")}<input type="file" id="dlvFile" accept=".xlsx,.csv,.txt" hidden></label>
           ${right ? "" : `<span class="sub">${esc(noRight())}</span>`}</div>
         <div class="sub">${esc(L2("Файл: колона A марка, колона B брой (редовете със заглавия се пропускат).", "File: column A mark, column B qty (header rows are skipped)."))}</div></div>
       <div class="scroll" style="margin-top:6px"><table><thead><tr><th>${L2("Дата", "Date")}</th><th>№</th><th>${L2("Марки", "Marks")}</th><th></th></tr></thead><tbody>`
-      + (state.deliveries.length ? state.deliveries.map((d, i) => `<tr${d.cancelled ? ' style="opacity:.5"' : ""}><td>${esc(fmtDate(d.date))}</td><td>${esc(d.note_no || "")}</td>
+      + (state.deliveries.length ? state.deliveries.map((d) => `<tr${d.cancelled ? ' style="opacity:.5"' : ""}><td>${esc(fmtDate(d.date))}</td><td>${esc(d.note_no || "")}</td>
           <td>${esc(L.parseLines(d.lines).map((l) => `${l.mark}×${l.qty}`).join(", "))}<div class="sub">${esc(d.by || "")}${d.cancelled ? " · " + L2("анулирана", "cancelled") : ""}</div></td>
-          <td>${d.cancelled || !right ? "" : state.cancelling === i
-            ? `<input type="text" id="dlvReason" placeholder="${esc(L2("Причина *", "Reason *"))}" style="width:90px"><div class="bar" style="margin:3px 0 0"><button class="small" data-act="dlvCancel" data-i="${i}">${L2("Анулирай", "Cancel it")}</button><button class="small secondary" data-act="dlvCancelNo">${L2("Не", "No")}</button></div>`
-            : `<button class="small secondary" data-act="dlvCancel" data-i="${i}">${L2("Анулирай", "Cancel")}</button>`}</td></tr>`).join("")
+          <td>${d.cancelled || !right ? "" : state.cancelling === d.link
+            ? `<input type="text" id="dlvReason" value="${esc(state.cancelReason || "")}" placeholder="${esc(L2("Причина *", "Reason *"))}" style="width:90px"><div class="bar" style="margin:3px 0 0"><button class="small" data-act="dlvCancel" data-link="${esc(d.link)}" ${gate.busy ? "disabled" : ""}>${esc(gate.busy === "dlvCancel" ? SAVING() : L2("Анулирай", "Void it"))}</button><button class="small secondary" data-act="dlvCancelNo">${L2("Не", "No")}</button></div>`
+            : `<button class="small secondary" data-act="dlvCancel" data-link="${esc(d.link)}" ${gate.busy ? "disabled" : ""}>${L2("Анулирай", "Void")}</button>`}</td></tr>`).join("")
         : `<tr><td colspan="4" class="sub">${L2("Няма доставки.", "No deliveries.")}</td></tr>`)
       + `</tbody></table></div>` + byMarkBox;
     const f = $("dlvFile");
@@ -1404,15 +1436,27 @@
     const act = b.dataset.act;
     // write buttons: refused while the model is being (re)loaded, counted while they run (review 10 M3)
     const WRITES = ["on", "off", "dlvAdd", "dlvCancel", "dlvPendOk", "fabApply", "moveLegacy", "clearFab", "noBackupGo"];
+    // the first "Анулирай" only opens the reason box: no write, so no gate and no "Записване…"
+    if (act === "dlvCancel" && state.cancelling !== b.dataset.link) { if (!gate.busy) openCancel(b.dataset.link); return; }
     const isWrite = WRITES.includes(act);
+    if (isWrite && gate.busy) return;   // a write is running: the second tap is ignored (sweep 18.11.2026)
     if (isWrite && book.loading) return flash(L2("Моделът се презарежда – опитайте след малко.", "The model is reloading – try again in a moment."), true);
-    guarded(() => (isWrite ? writing : (fn) => fn())(async () => {
+    // the typed text is read BEFORE the gate's render (which redraws the boxes) and before any await
+    const dlvText = act === "dlvAdd" ? (($("dlvText") || {}).value || "") : "";
+    const run = (fn) => (isWrite
+      ? gate.run(act === "on" || act === "off" ? `${act}:${b.dataset.kind}` : act, () => { render(); return writing(fn); }).finally(() => render())
+      : fn());
+    guarded(() => run(async () => {
       if (act === "on" || act === "off") await applyFlag(b.dataset.kind, act === "on");
       else if (act === "pickMark") await selectMark(b.dataset.mark);
-      else if (act === "dlvAdd") await addDelivery(R.parseDeliveryText($("dlvText").value).lines, "typed");
-      else if (act === "dlvCancel") await cancelDelivery(+b.dataset.i);
-      else if (act === "dlvCancelNo") { state.cancelling = null; render(); }
-      else if (act === "dlvPendOk") { const p = state.dlvPending; state.dlvPending = null; if (p) await addDelivery(p.lines, p.source); }
+      else if (act === "dlvAdd") await addDelivery(R.parseDeliveryText(dlvText).lines, "typed");
+      else if (act === "dlvCancel") await cancelDelivery(b.dataset.link);
+      else if (act === "dlvCancelNo") { state.cancelling = null; state.cancelReason = ""; render(); }
+      else if (act === "dlvPendOk") {
+        const p = state.dlvPending; state.dlvPending = null;
+        // a failed save puts the import back, so "Запиши доставката" can be tapped again (it is not lost)
+        if (p) { try { await addDelivery(p.lines, p.source); } catch (e) { if (!state.dlvPending) state.dlvPending = p; throw e; } }
+      }
       else if (act === "dlvPendNo") { state.dlvPending = null; setStatus(L2("Импортът е отказан.", "Import cancelled.")); render(); }
       else if (act === "fabApply") await applyFab();
       else if (act === "moveLegacy") await moveLegacy();
@@ -1462,6 +1506,7 @@
       filterTimer = setTimeout(() => { if (state.ready && $("markRows")) fillMarkRows(lastAv || avail()); }, 80);
       return;
     }
+    if (id === "dlvReason") { state.cancelReason = e.target.value; return; }   // kept across re-renders (sweep 18.11.2026)
     if (/^dlv(Date|No|Text)$/.test(id)) { state.dlvDraft = Object.assign(state.dlvDraft || {}, { [id]: e.target.value }); return; }   // round 8 M5
     const m = /^([dn])_(erected|wrong|hold)$/.exec(id);
     if (!m) return;
@@ -1562,7 +1607,12 @@
   async function loadPhaseA(gen) {
     const specs = await loadedModels();   // read once: the model set (item 8) and the versions of the child cache (2a)
     const run = { gen, modelsKey: L.modelSetKey(specs), records: false, parts: false };
-    const ctx = { stale: () => gen !== loadGen, all: null, failed: 0 };   // this load's own object cache and lookup failures
+    const ctx = { stale: () => gen !== loadGen, all: null, failed: 0, kids: new Map() };   // this load's own object cache and lookup failures
+    // The library, definitions and deliveries list need no GUID: started now, beside the viewer scan (sweep 18.11.2026;
+    // on a phone's first open they were ~3 serial pset round trips after the scan). Not during a "waiting for a model"
+    // retry (every 4 s), so an empty viewer does not repeat them. Their errors and the setup box still come only after
+    // the "no assemblies" check, in loadRecords (as Монолитен бетон).
+    const pre = waitTries ? null : startRecords();
     let got;
     try { got = await loadAssemblies(gen, ctx); if (!got) return false; }   // a newer load took over
     catch (e) { if (gen !== loadGen) return false; throw e; }   // an error of a superseded load (its model was unloaded) is not shown (L1)
@@ -1593,7 +1643,7 @@
         if (state.ready) { statusLine(false); render(); }
         toast(L2("Частите не са прочетени: ", "The parts could not be read: ") + state.partsError, true);
       }).finally(() => activeLoads.delete(gen));
-    try { if (!(await loadRecords(gen)) && gen !== loadGen) return true; }
+    try { if (!(await loadRecords(gen, pre)) && gen !== loadGen) return true; }
     catch (e) { if (gen !== loadGen) return true; throw e; }   // an error of a superseded load is not shown (round 4, L8)
     run.records = true;
     state.ready = true;
@@ -1626,6 +1676,11 @@
     // 3 s: a stage loads its models one after the other; one reload after the last of them (round 4, L9)
     if (event === "viewer.onModelStateChanged") reloadSoon(3000);
     if (!state.ready) return;
+    if (event === "viewer.onModelReset") {
+      // Connect's "Reset" cleared the colours: the box says so, for this session only - the remembered per-user
+      // setting (saveView) stays, so the next opening colours again, as pour-status (sweep 18.11.2026)
+      state.coloured = false; render();
+    }
     if (event === "viewer.onSelectionChanged" && state.follow) { clearTimeout(selTimer); selTimer = setTimeout(() => guarded(fromViewer), 200); }
   }
   if (window.parent === window) {

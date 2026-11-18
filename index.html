@@ -53,8 +53,11 @@
   .act .row button.undo { margin-left:auto; }
   #build { margin-top:18px; font-size:10.5px; color:var(--muted); text-align:right; }
   /* touch screens: bigger targets, 16px inputs so iOS does not zoom (week 1, A1) */
+  /* the "Импорт Excel/CSV" file picker is a label, not a button: sized here so touch screens enlarge it (sweep 18.11.2026) */
+  .filebtn { border:1px solid var(--line); padding:2px 7px; font-size:12px; cursor:pointer; }
   @media (pointer: coarse) {
     button, button.small, .tabs button { min-height:40px; padding:8px 12px; font-size:14px; }
+    .filebtn { min-height:40px; padding:8px 12px; font-size:14px; display:inline-flex; align-items:center; }
     select, input[type=date], input[type=text], textarea { min-height:40px; font-size:16px; }
     label.chk { min-height:36px; font-size:14px; }
     .act .row { gap:8px; }
@@ -129,13 +132,13 @@
 <script src="https://cdn.jsdelivr.net/npm/trimble-connect-workspace-api@0.3.38/dist/iife/trimbleconnect.workspace.api.js" integrity="sha384-lFiNt/56q6HnUNbuy0WHO3NP6BkQjY4EH8+5eELYVfnhkB42snRTmSa3UOAlX9gg" crossorigin="anonymous"></script>
 <script src="arsten-perf.js?v=21f7454938"></script>
 <script src="arsten-diag.js?v=bb0c6351fe"></script>
-<script src="arsten-i18n.js?v=de006467e2"></script>
-<script src="arsten-access.js?v=253829d007"></script>
-<script src="psetapi.js?v=f5bc3d57fb"></script>
-<script src="steel.js?v=2ffc777821"></script>
-<script src="records.js?v=f037461491"></script>
+<script src="arsten-i18n.js?v=c58f01c9fc"></script>
+<script src="arsten-access.js?v=fad565fcbe"></script>
+<script src="psetapi.js?v=970df94af2"></script>
+<script src="steel.js?v=f29b126cc7"></script>
+<script src="records.js?v=a7ccda6573"></script>
 <script src="fabrication.js?v=7108b8ac3e"></script>
-<script src="arsten-backup.js?v=032cc821bb"></script>
-<script src="app.js?v=4ce7fd8732"></script>
+<script src="arsten-backup.js?v=6c54dfe763"></script>
+<script src="app.js?v=c9b4ea357c"></script>
 </body>
 </html>

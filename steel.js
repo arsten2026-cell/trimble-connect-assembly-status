@@ -332,6 +332,67 @@
       .sort((a, b) => String(b.modified).localeCompare(String(a.modified)) || a.name.localeCompare(b.name));
   }
 
+  /**
+   * The items under _AM_Docs/Fabrication (Документи tab): {missing, complete, entries: [{item, path}]}. B is ArstenBackup
+   * (injected, so node tests run it with a mock Core). Sweep 18.11.2026: the old walk read one page of each listing with
+   * no by_path, so a long root / _AM_Docs listing gave "folder missing" and the files after page 1 were silently left out;
+   * designers (read on _AM_Docs/Fabrication only, AM_TEMPLATE) may not see _AM_Docs in the root listing at all.
+   * B.findFolder pages and asks by_path; B.listFolder pages every listing. complete false = the list may be short (a
+   * listing cut off, or the depth / 500-entry cap hit) and the panel says so instead of showing a silently short list.
+   */
+  const FAB_PATH = ["_AM_Docs", "Fabrication"];
+  async function listFabEntries(B, core, projectId) {
+    // the whole path by_path: findFolder lists _AM_Docs on its way, and that listing is 403 for a user who may read
+    // only _AM_Docs/Fabrication (AM_TEMPLATE designers)
+    const byPath = async () => {
+      for (const docs of ["_AM_Docs", "_ArstenDocs"]) {
+        try {
+          const g = await core.req(`folders/by_path?projectId=${encodeURIComponent(projectId)}&path=${encodeURIComponent(`/${docs}/Fabrication`)}`);
+          if (g && g.id && (!g.type || String(g.type).toUpperCase() === "FOLDER")) return g.id;
+        } catch (e) { if (e && e.status === 403) throw e; }
+      }
+      return null;
+    };
+    const find = async (fresh) => {
+      try { return { id: await B.findFolder(core, projectId, FAB_PATH, fresh ? { fresh: true } : undefined), cut: false }; }
+      catch (e) {
+        const cut = !!(e && e.code === "FOLDER_LISTING_CUT");
+        if (!cut && !(e && (e.status === 403 || e.status === 404) && !e.noAccess)) throw e;
+        const id = await byPath();
+        if (id) return { id, cut: false };
+        if (cut) return { id: null, cut: true };
+        throw e;
+      }
+    };
+    const walkFrom = async (rootId) => {
+      const entries = [];
+      let complete = true;
+      const walk = async (fid, path, depth) => {
+        const l = await B.listFolder(core, fid);
+        if (!l.complete) complete = false;
+        for (const x of l.items || []) {
+          if (String((x && x.type) || "").toUpperCase() === "FOLDER") {
+            if (depth < 4 && entries.length < 500) await walk(x.id, path ? `${path}/${x.name}` : x.name, depth + 1);
+            else complete = false;
+          } else entries.push({ item: x, path });
+        }
+      };
+      await walk(rootId, "", 0);
+      return { entries, complete };
+    };
+    let f = await find(false);
+    if (!f.id) return { missing: true, complete: !f.cut, entries: [] };
+    try { return Object.assign({ missing: false }, await walkFrom(f.id)); }
+    catch (e) {
+      // a remembered folder id (sessionStorage) may be stale after the folder was moved / recreated: look it up once afresh
+      if (!(e && (e.status === 404 || e.status === 403))) throw e;
+      B.forgetFolder(core, projectId, FAB_PATH);
+      f = await find(true);
+      if (!f.id) return { missing: true, complete: !f.cut, entries: [] };
+      return Object.assign({ missing: false }, await walkFrom(f.id));
+    }
+  }
+
   // ---------- week 3: exports with fabrication dates and weights (A14) ----------
   const colName = (i) => (i < 26 ? "" : String.fromCharCode(64 + Math.floor(i / 26))) + String.fromCharCode(65 + (i % 26));
   const r1 = (n) => Math.round(n * 10) / 10;
@@ -362,7 +423,7 @@
       byMark.get(m).push(a);
     }
     const header = [L("Марка", "Mark"), L("Бр. в модела", "In model"), L("Доставени", "Delivered"), L("Доставени: въведени", "Delivered: typed"), L("Доставени: Excel", "Delivered: Excel"),
-      L("Източник", "Source"), L("Монтирани", "Erected"), L("Налични (дост. − монт.)", "Available (deliv. − erect.)"), L("Светнали за монтаж", "Instances ready"), L("Не доставени", "Not delivered"),
+      L("Източник", "Source"), L("Монтирани", "Erected"), L("Готови за монтаж (дост. − монт.)", "Ready to erect (deliv. − erect.)"), L("Оцветени като готови в модела", "Shown as ready in the model"), L("Не доставени", "Not delivered"),
       L("Задържани", "On hold"), L("Грешни", "Wrong"),
       L("Изработени", "Fabricated"), L("Изработен от", "Fabricated from"), L("Изработен до", "Fabricated to"), L("Доставен (Excel) от", "Delivered (Excel) from"), L("Доставен (Excel) до", "Delivered (Excel) to"),
       L("Тегло 1 бр. (kg)", "Unit weight (kg)"), L("Тегло общо (kg)", "Total weight (kg)"), L("Изработено (kg)", "Fabricated (kg)"), L("Доставено (kg)", "Delivered (kg)"), L("Монтирано (kg)", "Erected (kg)"),
@@ -444,6 +505,17 @@
     });
     return out;
   }
+  /** Viewer reads of [{modelId, ids}] split into chunks of `size` ids, in model order then chunk order: one job
+   *  {modelId, ids, from, total} each, so a pool can read them side by side and the results still come back in the
+   *  serial order (sweep 18.11.2026, as viewer-project-status loadAssemblies). */
+  function classChunks(models, size) {
+    const n = Math.max(1, Math.floor(size) || 200), out = [];
+    for (const m of models || []) {
+      const ids = (m && m.ids) || [];
+      for (let i = 0; i < ids.length; i += n) out.push({ modelId: m.modelId, ids: ids.slice(i, i + n), from: i, total: ids.length });
+    }
+    return out;
+  }
   /** The chunk results (Map link -> props, null = not read) joined back per read, in chunk order: one Map per read. */
   function joinReads(reads, jobs, results) {
     const out = (reads || []).map(() => new Map());
@@ -480,6 +552,100 @@
       keep(next) { models = new Map([...(next || new Map())].filter(([, e]) => e && e.sig).map(([m, e]) => [m, { sig: e.sig, kids: e.kids }])); },
       size() { let n = 0; for (const e of models.values()) n += e.kids.size; return n; },
     };
+  }
+  /** n workers over items, in order of start; results by index. Used by findParents below. */
+  async function poolRun(items, n, fn) {
+    const out = new Array(items.length);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+      while (next < items.length) { const k = next++; out[k] = await fn(items[k], k); }
+    }));
+    return out;
+  }
+  /**
+   * The ElementAssembly parents of the parts, when neither the class filter nor the class scan lists assemblies
+   * (sweep 18.11.2026; the same as castunits.js findParents in Cast unit tags). It was one getHierarchyParents([id])
+   * call per object of every loaded model: a steel model with architecture loaded = tens of thousands of viewer calls,
+   * minutes per open and a 429 risk. Now the ids go in chunks (default 200, 4 at a time); the part -> assembly mapping
+   * comes from getHierarchyChildren of each found parent. Whatever those children do not cover (a chunk call that threw,
+   * or a viewer answering a many-id call with the first id's parent only) is asked one id at a time, as before - so the
+   * result is never worse than the old per-part path.
+   * getParents(ids) -> [{id}], getChildren(parentId) -> [child ids]. opts: chunk, pool, poolOne, stale() (stop asking).
+   * Returns { parents: [parent ids in found order], kids: Map parentId -> [child ids], calls }.
+   */
+  async function findParents(partIds, getParents, getChildren, opts) {
+    const o = opts || {};
+    const chunk = o.chunk || 200, poolN = o.pool || 4, poolOne = o.poolOne || 8;
+    const stale = typeof o.stale === "function" ? o.stale : () => false;
+    const parents = [], seen = new Set(), kids = new Map();
+    let calls = 0;
+    const add = (p) => { if (p && p.id != null && !seen.has(p.id)) { seen.add(p.id); parents.push(p.id); } };
+    const chunks = [];
+    for (let i = 0; i < partIds.length; i += chunk) chunks.push(partIds.slice(i, i + chunk));
+    await poolRun(chunks, poolN, async (ids) => {
+      if (stale()) return;
+      calls++;
+      try { for (const p of (await getParents(ids)) || []) add(p); } catch { /* covered by the per-id pass below */ }
+    });
+    const covered = new Set();
+    const readKids = async (pid) => {
+      if (kids.has(pid) || stale()) return;
+      kids.set(pid, []);   // claimed at once, so two workers never ask for the same parent
+      let list = [];
+      try { calls++; list = (await getChildren(pid)) || []; } catch {}
+      kids.set(pid, list);
+      for (const c of list) covered.add(c);
+    };
+    await poolRun(parents.slice(), poolOne, readKids);
+    const rest = partIds.filter((id) => !covered.has(id) && !seen.has(id));
+    // each worker takes its own run of neighbouring ids, in series: the parts of one assembly are usually listed
+    // together, so once a worker found their parent the next ones are covered and not asked again
+    const runs = [];
+    const step = Math.ceil(rest.length / poolOne) || 1;
+    for (let i = 0; i < rest.length; i += step) runs.push(rest.slice(i, i + step));
+    await poolRun(runs, poolOne, async (run) => {
+      for (const id of run) {
+        if (stale()) return;
+        if (covered.has(id)) continue;
+        calls++;
+        try {
+          for (const p of (await getParents([id])) || []) { add(p); await readKids(p.id); }
+        } catch {}
+      }
+    });
+    return { parents, kids, calls };
+  }
+  /**
+   * Library definitions checked side by side before the records are read (sweep 18.11.2026; were one GET after the
+   * other, 4 serial pset-api calls on a session's first open). 403 (not an admin: cannot create, reading still works)
+   * is ignored for all. Any other error of a status/hold/delivery definition is thrown, as before; one of the
+   * fabrication definition only comes back as fabFail (it disables the Производство tab, never the rest).
+   */
+  async function ensureDefinitions(ensure, defs, fabDef) {
+    let fail = null, fabFail = null;
+    const run = (d) => Promise.resolve().then(() => ensure(d));
+    await Promise.all((defs || []).map((d) => run(d).catch((e) => { if (!(e && e.status === 403) && !fail) fail = e; }))
+      .concat(fabDef ? [run(fabDef).catch((e) => { if (!(e && e.status === 403)) fabFail = e; })] : []));
+    if (fail) throw fail;
+    return { fabFail };
+  }
+  /** The part of the record read that needs no GUID (sweep 18.11.2026): the library lookup, then the definitions, then
+   *  the deliveries list (started, not awaited). Стомана starts it beside the viewer scan, as Монолитен бетон starts its
+   *  setup; before, the scan finished first and these 2-3 pset round trips came after it. c: {findLibrary,
+   *  ensureDefinition, listAll}; o: {projectId, names, defs, fabDef, delDef, delPrefix}. Resolves {found} when there is
+   *  no library, else {found, fabFail, dels} (dels: the listAll promise). Rejections are noted on both promises so an
+   *  unused prep (the scan failed, a newer load) is never an unhandled rejection; the caller still sees them on await. */
+  function prepRecords(c, o) {
+    const p = (async () => {
+      const found = (await c.findLibrary(o.projectId, o.names)) || {};
+      if (!found.lib) return { found };
+      const { fabFail } = await ensureDefinitions((d) => c.ensureDefinition(found.lib.id, d), o.defs, o.fabDef);
+      const dels = Promise.resolve().then(() => c.listAll(found.lib.id, o.delDef, o.delPrefix));
+      dels.catch(() => {});
+      return { found, fabFail, dels };
+    })();
+    p.catch(() => {});
+    return p;
   }
   /** Viewer selection -> assemblies from the maps built at load, without a call per part (item 9a / 10). byKey and
    *  ofChild are keyed "modelId:runtimeId" (assembly itself; part or bolt -> its assembly). Returns {list, unknown}:
@@ -538,7 +704,25 @@
     };
   }
 
+  /**
+   * One write at a time (sweep 18.11.2026, as Монолитен бетон state.saving): while a write runs, a second tap is
+   * refused instead of queued. On a slow site connection a double tap on „Запиши доставка“ used to save the same
+   * delivery note twice (two records, every mark counted as delivered twice). run(name, fn) -> {refused: true} when
+   * busy, else {value} of fn; busy is the name of the running write (null when idle), for the "Записване…" label.
+   */
+  function singleFlight() {
+    let busy = null;
+    return {
+      get busy() { return busy; },
+      async run(name, fn) {
+        if (busy) return { refused: true };
+        busy = name || "write";
+        try { return { value: await fn() }; } finally { busy = null; }
+      },
+    };
+  }
+
   return { TYPE2, type2Code, boltLine, reportRows, STATES, normMark, parseMarks, parseLines, linesText, deliveredByMark, availability, boxGap, pointBoxDist, tcGuidToIfc, resolveOther, resolveSides, boltList,
-    TABS, VIEW_DEFAULTS, readView, matchMark, fileTag, parseFabLog, importRefs, fileState, lastImport, fabFiles, colName, markExportRows, instanceExportRows,
-    chunkReads, joinReads, modelSig, modelSetKey, sameModelSet, childCache, selectionAssemblies, uniqueAssemblies, writeBook };
+    TABS, VIEW_DEFAULTS, readView, matchMark, fileTag, parseFabLog, importRefs, fileState, lastImport, fabFiles, listFabEntries, colName, markExportRows, instanceExportRows,
+    chunkReads, joinReads, classChunks, modelSig, modelSetKey, sameModelSet, childCache, selectionAssemblies, uniqueAssemblies, writeBook, singleFlight, findParents, ensureDefinitions, prepRecords };
 });
